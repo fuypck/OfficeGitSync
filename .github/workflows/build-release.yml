@@ -9,6 +9,10 @@ jobs:
   build:
     runs-on: windows-latest
 
+    # 🔑 关键解决部分：显式授予写入权限，允许创建 Release 和上传文件
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
