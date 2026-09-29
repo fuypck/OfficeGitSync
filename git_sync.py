@@ -14,17 +14,16 @@ from watchdog.events import FileSystemEventHandler
 from dulwich.repo import Repo
 from dulwich import porcelain
 
-# ==================== 项目元数据 ====================
-APP_NAME = "OfficeGitSync"
-APP_TITLE = "WPS/Office 文档 Git 备份助手"
+# ==================== 0. 软件元数据配置 ====================
+APP_NAME = "WPS/Office Git文档管理工具"
 APP_VERSION = "0.1.0"
 APP_AUTHOR = "Ed Clack"
-APP_HOVER_TIP = "基于git的WPS/Office文档管理工具"
+APP_DESCRIPTION = "基于git的WPS/Office文档管理工具"
 
 CONFIG_FILE = "config.json"
 SINGLE_INSTANCE_PORT = 47829
 
-# WPS/Office/Windows 常见临时文件与无关文件过滤后缀/前缀
+# Office/WPS/Windows 常见临时文件与无关文件过滤
 IGNORED_PATTERNS_PREFIX = ('~$', '.~', '.~lock.', '.~tmp')
 IGNORED_PATTERNS_SUFFIX = ('.tmp', '.bak', '.old', '.log', '.swp', '.lock')
 
@@ -72,7 +71,6 @@ def ensure_git_repo(folder_path):
     return True
 
 def get_folder_changed_files(folder_path):
-    """获取文件夹内当前真正发生变化的具体文件列表（过滤掉临时文件）"""
     folder_path = normalize_path(folder_path)
     if not os.path.exists(os.path.join(folder_path, ".git")):
         return []
@@ -82,7 +80,6 @@ def get_folder_changed_files(folder_path):
         status = porcelain.status(r)
         
         changed_files = set()
-        
         for _, files in status.staged.items():
             for f in files:
                 fname = f.decode('utf-8', errors='ignore') if isinstance(f, bytes) else str(f)
@@ -108,7 +105,6 @@ def get_folder_changed_files(folder_path):
         return []
 
 def commit_folder_changes(folder_path, changed_files, message):
-    """只 Stage 并 Commit 明确变更的文件"""
     folder_path = normalize_path(folder_path)
     try:
         r = Repo(folder_path)
@@ -122,8 +118,7 @@ def commit_folder_changes(folder_path, changed_files, message):
             if len(changed_files) > 3:
                 message += f" 等{len(changed_files)}个文件"
 
-        committer_str = f"{APP_AUTHOR} <{APP_AUTHOR.lower().replace(' ', '')}@local>"
-        porcelain.commit(r, message=message.encode("utf-8"), committer=committer_str.encode("utf-8"))
+        porcelain.commit(r, message=message.encode("utf-8"), committer=f"{APP_AUTHOR} <backup@local>".encode("utf-8"))
         return True
     except Exception as e:
         print(f"[Git Commit Error] {e}")
@@ -138,21 +133,21 @@ def get_git_history(folder_path):
         r = Repo(folder_path)
         logs = []
         try:
-            walker = r.get_walker(max_entries=200)
+            walker = r.get_walker(max_entries=100)
             for entry in walker:
                 commit = entry.commit
-                commit_id = commit.id.decode("utf-8")[:7]
-                commit_time_raw = commit.commit_time
-                commit_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(commit_time_raw))
-                # 生成基于时间戳风格的可视化版本标识
-                timestamp_id = time.strftime("%Y%m%d%H%M%S", time.localtime(commit_time_raw))
-                display_version_id = f"{timestamp_id} ({commit_id})"
+                raw_hash = commit.id.decode("utf-8")
+                commit_time_struct = time.localtime(commit.commit_time)
+                
+                # 转换格式：真实 Hash 用于底层的精确恢复，时间戳编号用于界面人性化显示
+                commit_time = time.strftime("%Y-%m-%d %H:%M:%S", commit_time_struct)
+                timestamp_id = "V" + time.strftime("%Y%m%d_%H%M%S", commit_time_struct)
                 
                 msg = commit.message.decode("utf-8", errors="ignore").strip()
                 logs.append({
-                    "hash": commit_id, 
-                    "display_id": display_version_id, 
-                    "date": commit_time, 
+                    "raw_hash": raw_hash,
+                    "display_id": timestamp_id,
+                    "date": commit_time,
                     "msg": msg
                 })
         except KeyError:
@@ -163,7 +158,6 @@ def get_git_history(folder_path):
         return []
 
 def restore_commit_safely(folder_path, commit_hash):
-    """无损版本恢复逻辑"""
     folder_path = normalize_path(folder_path)
     try:
         r = Repo(folder_path)
@@ -176,9 +170,8 @@ def restore_commit_safely(folder_path, commit_hash):
         porcelain.reset(r, mode="hard", treeish=target_commit_bytes)
         
         restore_msg = f"🔄 还原文档状态至历史版本 [{commit_hash[:7]}]"
-        committer_str = f"{APP_AUTHOR} <{APP_AUTHOR.lower().replace(' ', '')}@local>"
         porcelain.add(r, paths=".")
-        porcelain.commit(r, message=restore_msg.encode("utf-8"), committer=committer_str.encode("utf-8"))
+        porcelain.commit(r, message=restore_msg.encode("utf-8"), committer=f"{APP_AUTHOR} <backup@local>".encode("utf-8"))
         return True
     except Exception as e:
         print(f"[Git Restore Error] {e}")
@@ -287,12 +280,12 @@ class WatchdogDaemon:
             self.root.after(0, self.root.destroy)
 
         menu = pystray.Menu(
-            pystray.MenuItem(f"💻 打开主控制台 (v{APP_VERSION})", open_ui),
+            pystray.MenuItem("💻 打开主控制台", open_ui),
             pystray.MenuItem("❌ 退出程序", on_exit)
         )
 
-        # 鼠标悬停提示修改为“基于git的WPS/Office文档管理工具”
-        self.tray_icon = pystray.Icon(APP_NAME, image, APP_HOVER_TIP, menu)
+        # 鼠标悬停时的备注文字设置
+        self.tray_icon = pystray.Icon("OfficeGitSync", image, APP_DESCRIPTION, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def start(self):
@@ -307,7 +300,7 @@ class CombinedCommitWindow:
         self.entries = {}
         
         self.top = tk.Toplevel(parent_root)
-        self.top.title(f"📝 文档变更自动备份提交 - v{APP_VERSION}")
+        self.top.title("📝 文档变更自动备份提交")
         self.top.geometry("680x520")
         self.top.attributes("-topmost", True)
         self.top.protocol("WM_DELETE_WINDOW", self.on_cancel)
@@ -416,10 +409,10 @@ class MainWindow:
         self.root = root
         self.config = config
         self.on_config_change_cb = on_config_change_cb
-        self.sort_directions = {}  # 记录列排序方向
+        self.sort_reverse = {}  # 记录各列的排序顺序 (True 为倒序，False 为正序)
 
-        self.root.title(f"{APP_TITLE} v{APP_VERSION} - By {APP_AUTHOR}")
-        self.root.geometry("800x520")
+        self.root.title(f"{APP_NAME} v{APP_VERSION} - By {APP_AUTHOR}")
+        self.root.geometry("750x520")
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
         self.notebook = ttk.Notebook(self.root)
@@ -454,7 +447,10 @@ class MainWindow:
         bottom = ttk.Frame(self.tab_settings, padding=(0, 10, 0, 0))
         bottom.pack(fill="x")
         
-        ttk.Label(bottom, text=f"版本: v{APP_VERSION}  |  作者: {APP_AUTHOR}", foreground="gray").pack(side="left")
+        # 底部标注软件版本与作者
+        info_label = ttk.Label(bottom, text=f"版本: {APP_VERSION} | 作者: {APP_AUTHOR}", foreground="gray")
+        info_label.pack(side="left")
+
         ttk.Button(bottom, text="保存设置并生效", command=self.save_settings).pack(side="right")
 
     def setup_history_tab(self):
@@ -469,22 +465,23 @@ class MainWindow:
         table_frame = ttk.Frame(self.tab_history)
         table_frame.pack(fill="both", expand=True)
 
-        columns = ("display_id", "date", "msg", "raw_hash")
+        columns = ("display_id", "date", "msg")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         
-        # 定义列与对应点击排序处理
-        headers = {
+        # 定义各列，并绑定点击表头排序事件
+        self.columns_config = {
             "display_id": "版本ID (时间戳)",
             "date": "提交时间",
             "msg": "提交备注说明"
         }
-        for col_id, text in headers.items():
-            self.tree.heading(col_id, text=f"{text} ↕", command=lambda c=col_id: self.sort_tree_column(c))
+        
+        for col, title in self.columns_config.items():
+            self.tree.heading(col, text=f"{title} ↕", command=lambda _col=col: self.sort_column(_col))
+            self.sort_reverse[_col] = False
 
-        self.tree.column("display_id", width=180, anchor="center")
+        self.tree.column("display_id", width=160, anchor="center")
         self.tree.column("date", width=160, anchor="center")
-        self.tree.column("msg", width=340, anchor="w")
-        self.tree.column("raw_hash", width=0, stretch=False) # 隐藏列存放真实的 raw commit hash
+        self.tree.column("msg", width=320, anchor="w")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -503,18 +500,25 @@ class MainWindow:
             self.folder_cb.current(0)
             self.load_history(None)
 
-    def sort_tree_column(self, col):
-        """点击表头对表格进行排序"""
-        reverse = self.sort_directions.get(col, False)
-        
-        l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        l.sort(reverse=reverse)
+    def sort_column(self, col):
+        """点击表格表头实现排序算法"""
+        items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
+        reverse = not self.sort_reverse[col]
+        self.sort_reverse[col] = reverse
 
-        for index, (val, k) in enumerate(l):
+        # 进行自然排序
+        items.sort(reverse=reverse)
+
+        for index, (val, k) in enumerate(items):
             self.tree.move(k, '', index)
 
-        # 翻转排序状态
-        self.sort_directions[col] = not reverse
+        # 动态更新列头图标表示排序方向
+        for c, title in self.columns_config.items():
+            if c == col:
+                arrow = " ▲" if not reverse else " ▼"
+                self.tree.heading(c, text=f"{title}{arrow}")
+            else:
+                self.tree.heading(c, text=f"{title} ↕")
 
     def add_folder(self):
         folder = filedialog.askdirectory(parent=self.root, title="选择要监控的工作文件夹")
@@ -541,7 +545,7 @@ class MainWindow:
             self.load_history(None)
         if self.on_config_change_cb:
             self.on_config_change_cb(self.config)
-        messagebox.showinfo("成功", "监控目录设置保存成功！已开启无痕系统级监听！", parent=self.root)
+        messagebox.showinfo("成功", "监控目录设置保存成功！已开启系统级监听！", parent=self.root)
 
     def load_history(self, event):
         for item in self.tree.get_children():
@@ -551,7 +555,8 @@ class MainWindow:
             return
         logs = get_git_history(selected_folder)
         for log in logs:
-            self.tree.insert("", tk.END, values=(log["display_id"], log["date"], log["msg"], log["hash"]))
+            # item 对应的 text 存真实的 Commit raw_hash，方便还原操作；values 存界面展示内容
+            self.tree.insert("", tk.END, text=log["raw_hash"], values=(log["display_id"], log["date"], log["msg"]))
 
     def restore_selected(self):
         selected_item = self.tree.selection()
@@ -559,21 +564,22 @@ class MainWindow:
             messagebox.showwarning("提示", "请先在列表中选中一个要恢复的历史版本！", parent=self.root)
             return
 
+        commit_hash = self.tree.item(selected_item[0], "text")
         item_values = self.tree.item(selected_item[0], "values")
-        display_id, commit_date, commit_msg, raw_hash = item_values[0], item_values[1], item_values[2], item_values[3]
+        display_id, commit_date, commit_msg = item_values[0], item_values[1], item_values[2]
         selected_folder = self.folder_cb.get()
 
         confirm = messagebox.askyesno(
             "安全还原提示",
             f"您确定要将文件夹：\n{selected_folder}\n\n还原到以下历史版本吗？\n"
-            f"版本：{display_id}\n时间：{commit_date}\n备注：{commit_msg}\n\n"
-            f"✅ 提示：系统将以【追加备份】的方式还原文件，现有的所有 Commit 历史均会完整保留！",
+            f"版本ID：{display_id}\n时间：{commit_date}\n备注：{commit_msg}\n\n"
+            f"✅ 提示：系统将以【追加备份】的方式还原文件，现有的所有 Commit 历史均会完整保留，不会丢失！",
             parent=self.root
         )
 
         if confirm:
-            if restore_commit_safely(selected_folder, raw_hash):
-                messagebox.showinfo("成功", f"文件已恢复至 [{commit_date}] 的状态！并已自动创建还原记录节点。", parent=self.root)
+            if restore_commit_safely(selected_folder, commit_hash):
+                messagebox.showinfo("成功", f"文件已恢复至版本 [{display_id}] 的状态！并已自动创建还原记录节点。", parent=self.root)
                 self.load_history(None)
             else:
                 messagebox.showerror("错误", "恢复历史版本失败！", parent=self.root)
