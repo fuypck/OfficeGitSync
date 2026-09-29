@@ -9,6 +9,10 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageDraw
 import pystray
 
+# Windows 注册表库（仅在 Windows 环境使用）
+if sys.platform == "win32":
+    import winreg
+
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from dulwich.repo import Repo
@@ -16,12 +20,14 @@ from dulwich import porcelain
 
 # ==================== 0. 软件元数据配置 ====================
 APP_NAME = "WPS/Office Git文档管理工具"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 APP_AUTHOR = "Ed Clack"
 APP_DESCRIPTION = "基于git的WPS/Office文档管理工具"
 
 CONFIG_FILE = "config.json"
 SINGLE_INSTANCE_PORT = 47829
+REG_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+REG_ITEM_NAME = "OfficeGitSync"
 
 # Office/WPS/Windows 常见临时文件与无关文件过滤
 IGNORED_PATTERNS_PREFIX = ('~$', '.~', '.~lock.', '.~tmp')
@@ -38,15 +44,55 @@ def is_ignored_file(file_name):
         return True
     return False
 
-# ==================== 1. 配置管理 ====================
+# ==================== 1. 开机自启与配置管理 ====================
+def set_autostart(enable=True):
+    """设置或取消 Windows 开机自启"""
+    if sys.platform != "win32":
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY_PATH, 0, winreg.KEY_ALL_ACCESS)
+        if enable:
+            # 获取当前运行的 exe 或 py 路径，并加上 --minimized 参数
+            if getattr(sys, 'frozen', False):
+                exe_path = f'"{sys.executable}" --minimized'
+            else:
+                exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
+            winreg.SetValueEx(key, REG_ITEM_NAME, 0, winreg.REG_SZ, exe_path)
+        else:
+            try:
+                winreg.DeleteValue(key, REG_ITEM_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print(f"[AutoStart Error] {e}")
+        return False
+
+def check_autostart():
+    """检查是否已设置开机自启"""
+    if sys.platform != "win32":
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY_PATH, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, REG_ITEM_NAME)
+        winreg.CloseKey(key)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
 def load_config():
+    default_config = {"monitored_folders": [], "debounce_seconds": 3, "autostart": False}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
+                default_config.update(cfg)
         except Exception:
             pass
-    return {"monitored_folders": [], "debounce_seconds": 3}
+    return default_config
 
 def save_config(config):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -139,7 +185,6 @@ def get_git_history(folder_path):
                 raw_hash = commit.id.decode("utf-8")
                 commit_time_struct = time.localtime(commit.commit_time)
                 
-                # 时间戳编号用于界面显示
                 commit_time = time.strftime("%Y-%m-%d %H:%M:%S", commit_time_struct)
                 timestamp_id = "V" + time.strftime("%Y%m%d_%H%M%S", commit_time_struct)
                 
@@ -195,11 +240,12 @@ class OfficeFileEventHandler(FileSystemEventHandler):
         self.change_callback(self.folder_path)
 
 class WatchdogDaemon:
-    def __init__(self, root):
+    def __init__(self, root, start_minimized=False):
         self.root = root
         self.config = load_config()
         self.observer = Observer()
         self.is_popup_open = False
+        self.start_minimized = start_minimized
         
         self.pending_folders = set()
         self.debounce_timer = None
@@ -289,7 +335,8 @@ class WatchdogDaemon:
 
     def start(self):
         self.restart_monitoring()
-        self.main_win.show()
+        if not self.start_minimized:
+            self.main_win.show()
 
 # ==================== 4. UI 界面 ====================
 class CombinedCommitWindow:
@@ -411,7 +458,7 @@ class MainWindow:
         self.sort_reverse = {}
 
         self.root.title(f"{APP_NAME} v{APP_VERSION} - By {APP_AUTHOR}")
-        self.root.geometry("750x520")
+        self.root.geometry("750x540")
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
         self.notebook = ttk.Notebook(self.root)
@@ -443,10 +490,21 @@ class MainWindow:
         ttk.Button(btn_frame, text="添加文件夹", command=self.add_folder).pack(fill="x", pady=5)
         ttk.Button(btn_frame, text="移除选中", command=self.remove_folder).pack(fill="x", pady=5)
 
+        # 选项区域：开机自启
+        opt_frame = ttk.LabelFrame(self.tab_settings, text=" 系统选项 ", padding=10)
+        opt_frame.pack(fill="x", pady=(10, 0))
+
+        self.autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
+        ttk.Checkbutton(
+            opt_frame, 
+            text="开机自动启动（后台静默运行到系统托盘）", 
+            variable=self.autostart_var
+        ).pack(anchor="w")
+
         bottom = ttk.Frame(self.tab_settings, padding=(0, 10, 0, 0))
         bottom.pack(fill="x")
         
-        info_label = ttk.Label(bottom, text=f"版本: {APP_VERSION} | 作者: {APP_AUTHOR}", foreground="gray")
+        info_label = ttk.Label(bottom, text=f"版本: v{APP_VERSION} | 作者: {APP_AUTHOR}", foreground="gray")
         info_label.pack(side="left")
 
         ttk.Button(bottom, text="保存设置并生效", command=self.save_settings).pack(side="right")
@@ -472,7 +530,6 @@ class MainWindow:
             "msg": "提交备注说明"
         }
         
-        # 修正闭包绑定的 lambda 写法：使用 c=col 正确捕获当前的 col
         for col, title in self.columns_config.items():
             self.tree.heading(col, text=f"{title} ↕", command=lambda c=col: self.sort_column(c))
             self.sort_reverse[col] = False
@@ -499,7 +556,6 @@ class MainWindow:
             self.load_history(None)
 
     def sort_column(self, col):
-        """点击表格表头实现自然排序算法"""
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         reverse = not self.sort_reverse[col]
         self.sort_reverse[col] = reverse
@@ -533,15 +589,21 @@ class MainWindow:
         folders = [normalize_path(f) for f in self.listbox.get(0, tk.END)]
         for f in folders:
             ensure_git_repo(f)
+        
+        autostart_enable = self.autostart_var.get()
+        set_autostart(autostart_enable)
+
         self.config["monitored_folders"] = folders
+        self.config["autostart"] = autostart_enable
         save_config(self.config)
+
         self.folder_cb["values"] = folders
         if folders:
             self.folder_cb.current(0)
             self.load_history(None)
         if self.on_config_change_cb:
             self.on_config_change_cb(self.config)
-        messagebox.showinfo("成功", "监控目录设置保存成功！已开启系统级监听！", parent=self.root)
+        messagebox.showinfo("成功", "监控目录与系统选项保存成功！", parent=self.root)
 
     def load_history(self, event):
         for item in self.tree.get_children():
@@ -622,11 +684,15 @@ def try_notify_existing_instance():
         return False
 
 if __name__ == "__main__":
+    start_minimized = "--minimized" in sys.argv
+
     if try_notify_existing_instance():
         sys.exit(0)
 
     root = tk.Tk()
-    daemon = WatchdogDaemon(root)
+    root.withdraw()  # 默认先隐藏主窗口
+
+    daemon = WatchdogDaemon(root, start_minimized=start_minimized)
     start_single_instance_listener(root, daemon)
     daemon.start()
 

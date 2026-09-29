@@ -3,7 +3,7 @@ name: Auto Build Windows Release
 on:
   push:
     tags:
-      - 'v*'  # 当推送以 v 开头的标签（如 v0.1.0）时触发自动化构建
+      - 'v*'
 
 jobs:
   build:
@@ -25,11 +25,11 @@ jobs:
 
       - name: Build Executable with PyInstaller
         run: |
-          pyinstaller --noconsole --onefile --name "OfficeGitSync_v0.1.0" git_sync.py
+          pyinstaller --noconsole --onefile --name "OfficeGitSync_v0.1.1" git_sync.py
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/OfficeGitSync_v0.1.0.exe
+          files: dist/OfficeGitSync_v0.1.1.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
