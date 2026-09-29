@@ -139,7 +139,7 @@ def get_git_history(folder_path):
                 raw_hash = commit.id.decode("utf-8")
                 commit_time_struct = time.localtime(commit.commit_time)
                 
-                # 转换格式：真实 Hash 用于底层的精确恢复，时间戳编号用于界面人性化显示
+                # 时间戳编号用于界面显示
                 commit_time = time.strftime("%Y-%m-%d %H:%M:%S", commit_time_struct)
                 timestamp_id = "V" + time.strftime("%Y%m%d_%H%M%S", commit_time_struct)
                 
@@ -284,7 +284,6 @@ class WatchdogDaemon:
             pystray.MenuItem("❌ 退出程序", on_exit)
         )
 
-        # 鼠标悬停时的备注文字设置
         self.tray_icon = pystray.Icon("OfficeGitSync", image, APP_DESCRIPTION, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
@@ -409,7 +408,7 @@ class MainWindow:
         self.root = root
         self.config = config
         self.on_config_change_cb = on_config_change_cb
-        self.sort_reverse = {}  # 记录各列的排序顺序 (True 为倒序，False 为正序)
+        self.sort_reverse = {}
 
         self.root.title(f"{APP_NAME} v{APP_VERSION} - By {APP_AUTHOR}")
         self.root.geometry("750x520")
@@ -447,7 +446,6 @@ class MainWindow:
         bottom = ttk.Frame(self.tab_settings, padding=(0, 10, 0, 0))
         bottom.pack(fill="x")
         
-        # 底部标注软件版本与作者
         info_label = ttk.Label(bottom, text=f"版本: {APP_VERSION} | 作者: {APP_AUTHOR}", foreground="gray")
         info_label.pack(side="left")
 
@@ -468,16 +466,16 @@ class MainWindow:
         columns = ("display_id", "date", "msg")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         
-        # 定义各列，并绑定点击表头排序事件
         self.columns_config = {
             "display_id": "版本ID (时间戳)",
             "date": "提交时间",
             "msg": "提交备注说明"
         }
         
+        # 修正闭包绑定的 lambda 写法：使用 c=col 正确捕获当前的 col
         for col, title in self.columns_config.items():
-            self.tree.heading(col, text=f"{title} ↕", command=lambda _col=col: self.sort_column(_col))
-            self.sort_reverse[_col] = False
+            self.tree.heading(col, text=f"{title} ↕", command=lambda c=col: self.sort_column(c))
+            self.sort_reverse[col] = False
 
         self.tree.column("display_id", width=160, anchor="center")
         self.tree.column("date", width=160, anchor="center")
@@ -501,18 +499,16 @@ class MainWindow:
             self.load_history(None)
 
     def sort_column(self, col):
-        """点击表格表头实现排序算法"""
+        """点击表格表头实现自然排序算法"""
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         reverse = not self.sort_reverse[col]
         self.sort_reverse[col] = reverse
 
-        # 进行自然排序
         items.sort(reverse=reverse)
 
         for index, (val, k) in enumerate(items):
             self.tree.move(k, '', index)
 
-        # 动态更新列头图标表示排序方向
         for c, title in self.columns_config.items():
             if c == col:
                 arrow = " ▲" if not reverse else " ▼"
@@ -555,7 +551,6 @@ class MainWindow:
             return
         logs = get_git_history(selected_folder)
         for log in logs:
-            # item 对应的 text 存真实的 Commit raw_hash，方便还原操作；values 存界面展示内容
             self.tree.insert("", tk.END, text=log["raw_hash"], values=(log["display_id"], log["date"], log["msg"]))
 
     def restore_selected(self):
