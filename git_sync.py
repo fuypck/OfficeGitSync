@@ -162,8 +162,23 @@ class CommitDialog(tk.Toplevel):
             return
         try:
             repo = Repo(self.repo_dir)
-            repo.stage([f.encode('utf-8') if isinstance(f, str) else f for f in self.changed_files])
-            repo.do_commit(msg.encode('utf-8'), committer=f"{APP_NAME} <backup@local>".encode('utf-8'))
+            index = repo.get_index()
+            
+            # 使用 Dulwich 正确添加文件到暂存区 (Index)
+            for file_path in self.changed_files:
+                # 转换路径为 utf-8 字节流
+                path_bytes = file_path.encode('utf-8') if isinstance(file_path, str) else file_path
+                index.add(path_bytes)
+            
+            # 写回 index 索引树
+            index.write()
+
+            # 执行 Commit
+            repo.do_commit(
+                message=msg.encode('utf-8'), 
+                committer=f"{APP_NAME} <backup@local>".encode('utf-8')
+            )
+            
             log_message(f"成功提交 Commit: {msg}", self.enable_log)
             messagebox.showinfo("成功", "工作文档已完成备份提交！")
             self.destroy()
@@ -443,7 +458,7 @@ class BackupApp:
             show_error("设置失败", "无法修改注册表开机自启项", str(e), self.enable_log)
 
     def on_file_changed(self):
-        """文件更新触发自动弹出 Commit 提交窗口（需求 6）"""
+        """文件更新触发自动弹出 Commit 提交窗口"""
         try:
             untracked = []
             handler = GitDebounceHandler(self.watch_dir, exclude_patterns=self.exclude_patterns)
@@ -453,7 +468,8 @@ class BackupApp:
                 for file in files:
                     full_path = os.path.join(root, file)
                     if not handler.is_excluded(full_path):
-                        rel_path = os.path.relpath(full_path, self.watch_dir)
+                        # 获取标准的相对路径并转换为斜杠路径
+                        rel_path = os.path.relpath(full_path, self.watch_dir).replace("\\", "/")
                         untracked.append(rel_path)
 
             if untracked:
