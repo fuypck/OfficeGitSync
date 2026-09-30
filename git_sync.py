@@ -336,8 +336,10 @@ class BackupApp:
             self.pattern_listbox.insert(tk.END, pattern)
 
     def check_and_init_repo(self, target_dir):
-        """检测并处理 .git 目录导入（需求 9）"""
+        """检测并处理 .git 目录导入（修复 WinError 183 报错）"""
         git_dir = os.path.join(target_dir, ".git")
+        
+        # 1. 情况一：如果 .git 已经存在，询问是否导入并直接加载
         if os.path.exists(git_dir):
             confirm = messagebox.askyesno(
                 "导入现有 Git 仓库", 
@@ -345,11 +347,20 @@ class BackupApp:
             )
             if not confirm:
                 return False
+            try:
+                # 已经存在 .git 时，直接实例化打开，切勿调用 Repo.init()
+                Repo(target_dir)
+                return True
+            except Exception as e:
+                show_error("打开仓库失败", "无法读取已存在的 Git 版本库", str(e), self.enable_log)
+                return False
+
+        # 2. 情况二：如果 .git 不存在，才执行全新的初始化
         try:
             Repo.init(target_dir)
             return True
         except Exception as e:
-            show_error("初始化仓库失败", "无法创建/载入 Git 版本库", str(e), self.enable_log)
+            show_error("初始化仓库失败", "无法创建 Git 版本库", str(e), self.enable_log)
             return False
 
     def browse_directory(self):
