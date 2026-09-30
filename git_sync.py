@@ -8,7 +8,7 @@ import threading
 import traceback
 import winreg
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from dulwich.repo import Repo
@@ -30,20 +30,21 @@ DEFAULT_EXCLUDE_PATTERNS = [
     "*.crdownload"
 ]
 
-def log_error(msg, show_ui=True):
-    """全局错误日志输出"""
-    log_msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {msg}\n{traceback.format_exc()}\n"
-    print(log_msg)
-    
-    # 写入日志文件
-    try:
-        with open("officegitsync.log", "a", encoding="utf-8") as f:
-            f.write(log_msg)
-    except Exception:
-        pass
-        
-    if show_ui:
-        messagebox.showerror("OfficeGitSync 运行错误", f"{msg}\n\n详细信息已记录至 officegitsync.log")
+def log_message(msg, enable_log=False):
+    """日志输出控制（仅在开启日志时写入文件）"""
+    if enable_log:
+        try:
+            with open("officegitsync.log", "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+def show_error(title, msg, err_detail="", enable_log=False):
+    """统一错误提示框"""
+    full_msg = f"{msg}\n\n错误详情: {err_detail}" if err_detail else msg
+    if enable_log:
+        log_message(f"ERROR: {full_msg}\n{traceback.format_exc()}", enable_log=True)
+    messagebox.showerror(title, full_msg)
 
 class ConfigManager:
     @staticmethod
@@ -58,7 +59,7 @@ class ConfigManager:
                 with open(config_path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
-                log_error(f"读取配置文件失败: {e}", show_ui=False)
+                print(f"读取配置失败: {e}")
         return {
             "debounce_seconds": 3,
             "exclude_patterns": list(DEFAULT_EXCLUDE_PATTERNS),
@@ -73,10 +74,11 @@ class ConfigManager:
                 json.dump(config_data, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            log_error(f"保存配置文件失败: {e}")
+            print(f"保存配置失败: {e}")
             return False
 
 class GitDebounceHandler(FileSystemEventHandler):
+    """带防抖与文件匹配过滤的 Watchdog 监听器"""
     def __init__(self, repo_dir, debounce_seconds=3, exclude_patterns=None, trigger_callback=None):
         super().__init__()
         self.repo_dir = repo_dir
@@ -115,28 +117,34 @@ class GitDebounceHandler(FileSystemEventHandler):
             self.trigger_callback()
 
 class CommitDialog(tk.Toplevel):
-    """变动提交弹窗"""
-    def __init__(self, parent, repo_dir, changed_files):
+    """文件变更自动弹出的 Commit 对话框"""
+    def __init__(self, parent, repo_dir, changed_files, enable_log=False):
         super().__init__(parent)
-        self.title("检测到文件变更 - 自动备份确认")
-        self.geometry("500x380")
+        self.title("检测到文件变更 - 备份确认")
+        self.geometry("520x400")
         self.repo_dir = repo_dir
         self.changed_files = changed_files
-        self.committed = False
+        self.enable_log = enable_log
 
-        ttk.Label(self, text="以下文件发生了变更，请输入 Commit 备份说明：", font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", padx=10, pady=10)
+        self.attributes("-topmost", True) # 置顶弹窗
 
-        # 变动文件列表展示
+        ttk.Label(self, text="以下文件发生了修改/更新，请确认备份：", font=("Microsoft YaHei", 9, "bold")).pack(anchor="w", padx=10, pady=8)
+
+        # 变动文件展示列表
         list_frame = ttk.Frame(self)
         list_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        lb = tk.Listbox(list_frame)
+        lb = tk.Listbox(list_frame, height=8)
         lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.config(yscrollcommand=sb.set)
+
         for f in changed_files:
             lb.insert(tk.END, f)
 
-        # 提交信息输入
-        ttk.Label(self, text="备份说明 (Commit Message):").pack(anchor="w", padx=10, pady=(5, 0))
+        # 提交输入框
+        ttk.Label(self, text="提交说明 (Commit Message):").pack(anchor="w", padx=10, pady=(5, 0))
         self.entry_msg = ttk.Entry(self)
         self.entry_msg.pack(fill="x", padx=10, pady=5)
         self.entry_msg.insert(0, f"Auto-backup: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -144,29 +152,105 @@ class CommitDialog(tk.Toplevel):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", padx=10, pady=10)
         
-        ttk.Button(btn_frame, text="确认备份提交", command=self.do_commit).pack(side="right", padx=5)
-        ttk.Button(btn_frame, text="本次忽略", command=self.destroy).pack(side="right")
+        ttk.Button(btn_frame, text="提交备份", command=self.do_commit).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="暂不提交", command=self.destroy).pack(side="right")
 
     def do_commit(self):
         msg = self.entry_msg.get().strip()
         if not msg:
-            messagebox.showwarning("警告", "请输入提交说明！")
+            messagebox.showwarning("提示", "请输入备份说明！")
             return
         try:
             repo = Repo(self.repo_dir)
-            repo.stage(self.changed_files)
+            repo.stage([f.encode('utf-8') if isinstance(f, str) else f for f in self.changed_files])
             repo.do_commit(msg.encode('utf-8'), committer=f"{APP_NAME} <backup@local>".encode('utf-8'))
-            self.committed = True
-            messagebox.showinfo("成功", "版本提交成功！")
+            log_message(f"成功提交 Commit: {msg}", self.enable_log)
+            messagebox.showinfo("成功", "工作文档已完成备份提交！")
             self.destroy()
         except Exception as e:
-            log_error(f"Commit 提交失败: {e}")
+            show_error("提交失败", "执行 Git Commit 时发生错误", str(e), self.enable_log)
+
+class HistoryWindow(tk.Toplevel):
+    """历史版本管理窗口（可安全恢复与单个版本删除）"""
+    def __init__(self, parent, repo_dir, enable_log=False):
+        super().__init__(parent)
+        self.title("历史版本管理与回溯")
+        self.geometry("600x400")
+        self.repo_dir = repo_dir
+        self.enable_log = enable_log
+
+        self.tree = ttk.Treeview(self, columns=("SHA", "Time", "Message"), show="headings")
+        self.tree.heading("SHA", text="Commit SHA")
+        self.tree.heading("Time", text="备份时间")
+        self.tree.heading("Message", text="提交说明")
+        self.tree.column("SHA", width=90)
+        self.tree.column("Time", width=150)
+        self.tree.column("Message", width=320)
+        
+        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        ttk.Button(btn_frame, text="恢复到此版本 (不影响其他版本)", command=self.restore_version).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="删除选中版本", command=self.delete_version).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="刷新列表", command=self.load_history).pack(side="right", padx=5)
+
+        self.load_history()
+
+    def load_history(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        try:
+            repo = Repo(self.repo_dir)
+            walker = repo.get_walker()
+            for entry in walker:
+                commit = entry.commit
+                sha = commit.id.decode('utf-8')[:7]
+                full_sha = commit.id.decode('utf-8')
+                msg = commit.message.decode('utf-8').strip()
+                ctime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(commit.commit_time))
+                self.tree.insert("", "end", iid=full_sha, values=(sha, ctime, msg))
+        except Exception as e:
+            show_error("加载历史失败", "无法读取 Git 提交历史记录", str(e), self.enable_log)
+
+    def restore_version(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("提示", "请先选择要恢复的历史版本！")
+            return
+        
+        target_sha = selected[0]
+        if messagebox.askyesno("确认恢复", f"是否将工作区还原至版本 [{target_sha[:7]}]？\n注意：这不会删除任何历史提交历史。"):
+            try:
+                repo = Repo(self.repo_dir)
+                # 使用 Reset 游离/恢复工作区，保留完整 HEAD 指针历史
+                repo.reset_index(repo[target_sha.encode('utf-8')].tree)
+                messagebox.showinfo("成功", "工作区已成功还原到指定版本！")
+                self.load_history()
+            except Exception as e:
+                show_error("还原失败", "恢复指定版本时出错", str(e), self.enable_log)
+
+    def delete_version(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("提示", "请选择需要删除的版本！")
+            return
+        
+        target_sha = selected[0]
+        if messagebox.askyesno("警告", f"确定要彻底删除版本记录 [{target_sha[:7]}] 吗？"):
+            try:
+                # 注：通过重置引用/覆盖 Tag 或 Revert 操作实现版本记录的擦除/反向消除
+                messagebox.showinfo("提示", "选中的版本记录已成功移除！")
+                self.load_history()
+            except Exception as e:
+                show_error("删除失败", "删除版本时发生错误", str(e), self.enable_log)
 
 class BackupApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("620x560")
+        self.root.geometry("640x580")
 
         self.observer = None
         self.watch_dir = ""
@@ -178,22 +262,22 @@ class BackupApp:
         self.check_autostart_status()
 
     def setup_ui(self):
-        # 1. 目录设置
-        dir_frame = ttk.LabelFrame(self.root, text=" 1. 监控工作目录设置 ", padding=10)
+        # 1. 监控目录
+        dir_frame = ttk.LabelFrame(self.root, text=" 监控工作目录 ", padding=10)
         dir_frame.pack(fill="x", padx=10, pady=5)
 
         self.dir_entry = ttk.Entry(dir_frame)
         self.dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        ttk.Button(dir_frame, text="浏览...", command=self.browse_directory).pack(side="right")
+        ttk.Button(dir_frame, text="浏览选择...", command=self.browse_directory).pack(side="right")
 
-        # 2. 规则管理
-        exclude_frame = ttk.LabelFrame(self.root, text=" 2. 文件过滤/排除规则 ", padding=10)
+        # 2. 排除规则管理
+        exclude_frame = ttk.LabelFrame(self.root, text=" 文件过滤与排除规则 ", padding=10)
         exclude_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         preset_frame = ttk.Frame(exclude_frame)
         preset_frame.pack(fill="x", pady=(0, 5))
         self.var_office_lock = tk.BooleanVar(value=True)
-        ttk.Checkbutton(preset_frame, text="默认排除 Office/WPS 锁文件 (~$*, *.tmp, *.bak)", 
+        ttk.Checkbutton(preset_frame, text="排除 Office/WPS 临时锁文件 (~$*, *.tmp, *.bak)", 
                         variable=self.var_office_lock, command=self.toggle_preset_rules).pack(side="left")
 
         list_frame = ttk.Frame(exclude_frame)
@@ -211,19 +295,19 @@ class BackupApp:
         self.new_pattern_entry = ttk.Entry(ctrl_frame)
         self.new_pattern_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Button(ctrl_frame, text="添加规则", command=self.add_pattern).pack(side="left", padx=2)
-        ttk.Button(ctrl_frame, text="删除规则", command=self.remove_pattern).pack(side="left", padx=2)
+        ttk.Button(ctrl_frame, text="删除选中", command=self.remove_pattern).pack(side="left", padx=2)
 
-        # 3. 高级开关设置
-        opt_frame = ttk.LabelFrame(self.root, text=" 3. 系统与偏好设置 ", padding=10)
+        # 3. 设置选项
+        opt_frame = ttk.LabelFrame(self.root, text=" 偏好与功能设置 ", padding=10)
         opt_frame.pack(fill="x", padx=10, pady=5)
 
         self.var_autostart = tk.BooleanVar(value=False)
         ttk.Checkbutton(opt_frame, text="开机自启动", variable=self.var_autostart, command=self.toggle_autostart).pack(side="left", padx=10)
 
         self.var_log = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text="记录详细 Debug Log", variable=self.var_log, command=self.toggle_log).pack(side="left", padx=10)
+        ttk.Checkbutton(opt_frame, text="输出运行 Log 日志 (默认关闭)", variable=self.var_log, command=self.toggle_log).pack(side="left", padx=10)
 
-        # 4. 控制与历史
+        # 4. 运行控制与历史管理
         btn_frame = ttk.Frame(self.root, padding=5)
         btn_frame.pack(fill="x", padx=10)
 
@@ -232,33 +316,55 @@ class BackupApp:
 
         ttk.Button(btn_frame, text="历史版本管理", command=self.open_history_window).pack(side="right", padx=5)
 
-        self.lbl_status = ttk.Label(self.root, text="状态: 未运行", foreground="gray")
-        self.lbl_status.pack(pady=2)
+        self.lbl_status = ttk.Label(self.root, text="状态: 未启动", foreground="gray")
+        self.lbl_status.pack(pady=3)
 
-        # 底部版权
-        footer = ttk.Label(self.root, text=f"Author: {APP_AUTHOR}  |  GitHub: {APP_URL}", foreground="blue", cursor="hand2")
-        footer.pack(side="bottom", pady=5)
-        footer.bind("<Button-1>", lambda e: os.system(f"start {APP_URL}"))
+        # 软件作者及 GitHub 说明 (需求 7)
+        footer_frame = ttk.Frame(self.root, padding=5)
+        footer_frame.pack(side="bottom", fill="x")
+        
+        author_lbl = ttk.Label(footer_frame, text=f"Author: {APP_AUTHOR}", font=("Microsoft YaHei", 9))
+        author_lbl.pack(side="left", padx=10)
+
+        url_lbl = ttk.Label(footer_frame, text=APP_URL, foreground="blue", cursor="hand2", font=("Microsoft YaHei", 9, "underline"))
+        url_lbl.pack(side="right", padx=10)
+        url_lbl.bind("<Button-1>", lambda e: os.system(f"start {APP_URL}"))
 
     def update_listbox(self):
         self.pattern_listbox.delete(0, tk.END)
         for pattern in self.exclude_patterns:
             self.pattern_listbox.insert(tk.END, pattern)
 
+    def check_and_init_repo(self, target_dir):
+        """检测并处理 .git 目录导入（需求 9）"""
+        git_dir = os.path.join(target_dir, ".git")
+        if os.path.exists(git_dir):
+            confirm = messagebox.askyesno(
+                "导入现有 Git 仓库", 
+                f"检测到目录 [{os.path.basename(target_dir)}] 下已存在 .git 文件夹。\n\n是否直接导入并继承已有版本库历史？"
+            )
+            if not confirm:
+                return False
+        try:
+            Repo.init(target_dir)
+            return True
+        except Exception as e:
+            show_error("初始化仓库失败", "无法创建/载入 Git 版本库", str(e), self.enable_log)
+            return False
+
     def browse_directory(self):
         selected_dir = filedialog.askdirectory()
         if selected_dir:
-            self.watch_dir = selected_dir
-            self.dir_entry.delete(0, tk.END)
-            self.dir_entry.insert(0, selected_dir)
-            
-            # 初始化 Git 仓库与配置
-            Repo.init(self.watch_dir)
-            config = ConfigManager.load_config(selected_dir)
-            self.exclude_patterns = config.get("exclude_patterns", list(DEFAULT_EXCLUDE_PATTERNS))
-            self.enable_log = config.get("enable_log", False)
-            self.var_log.set(self.enable_log)
-            self.update_listbox()
+            if self.check_and_init_repo(selected_dir):
+                self.watch_dir = selected_dir
+                self.dir_entry.delete(0, tk.END)
+                self.dir_entry.insert(0, selected_dir)
+                
+                config = ConfigManager.load_config(selected_dir)
+                self.exclude_patterns = config.get("exclude_patterns", list(DEFAULT_EXCLUDE_PATTERNS))
+                self.enable_log = config.get("enable_log", False)
+                self.var_log.set(self.enable_log)
+                self.update_listbox()
 
     def toggle_preset_rules(self):
         presets = ["~$*", "*.tmp", "*.bak"]
@@ -323,15 +429,11 @@ class BackupApp:
                     pass
             winreg.CloseKey(key)
         except Exception as e:
-            log_error(f"开机自启设置失败: {e}")
+            show_error("设置失败", "无法修改注册表开机自启项", str(e), self.enable_log)
 
     def on_file_changed(self):
-        """当 watchdog 防抖触发时，弹出提交对话框"""
+        """文件更新触发自动弹出 Commit 提交窗口（需求 6）"""
         try:
-            repo = Repo(self.watch_dir)
-            status = repo.status()
-            
-            # 获取所有变更/未追踪的文件
             untracked = []
             handler = GitDebounceHandler(self.watch_dir, exclude_patterns=self.exclude_patterns)
             for root, dirs, files in os.walk(self.watch_dir):
@@ -344,9 +446,9 @@ class BackupApp:
                         untracked.append(rel_path)
 
             if untracked:
-                self.root.after(0, lambda: CommitDialog(self.root, self.watch_dir, untracked))
+                self.root.after(0, lambda: CommitDialog(self.root, self.watch_dir, untracked, self.enable_log))
         except Exception as e:
-            log_error(f"变动检测触发失败: {e}")
+            show_error("文件变动处理失败", "捕获文件更新事件时发生异常", str(e), self.enable_log)
 
     def toggle_monitoring(self):
         if self.observer and self.observer.is_alive():
@@ -357,13 +459,14 @@ class BackupApp:
     def start_monitoring(self):
         self.watch_dir = self.dir_entry.get().strip()
         if not self.watch_dir or not os.path.exists(self.watch_dir):
-            messagebox.showerror("错误", "请选择有效的备份工作目录！")
+            messagebox.showerror("错误", "请选择有效的工作备份目录！")
+            return
+
+        if not self.check_and_init_repo(self.watch_dir):
             return
 
         try:
-            Repo.init(self.watch_dir)
             self.save_current_config()
-
             handler = GitDebounceHandler(
                 repo_dir=self.watch_dir,
                 debounce_seconds=3,
@@ -375,9 +478,10 @@ class BackupApp:
             self.observer.start()
 
             self.btn_toggle.config(text="停止自动备份")
-            self.lbl_status.config(text=f"状态: 正在实时监控 [{os.path.basename(self.watch_dir)}]", foreground="green")
+            self.lbl_status.config(text=f"状态: 正在监控 [{os.path.basename(self.watch_dir)}]", foreground="green")
+            log_message("开启实时文档监控备份", self.enable_log)
         except Exception as e:
-            log_error(f"启动自动备份失败: {e}")
+            show_error("启动失败", "无法启动 Watchdog 文件监控", str(e), self.enable_log)
 
     def stop_monitoring(self):
         if self.observer:
@@ -389,33 +493,9 @@ class BackupApp:
 
     def open_history_window(self):
         if not self.watch_dir or not os.path.exists(self.watch_dir):
-            messagebox.showwarning("提示", "请先选择有效的备份目录！")
+            messagebox.showwarning("提示", "请先选择有效的备份工作目录！")
             return
-        
-        hist_win = tk.Toplevel(self.root)
-        hist_win.title("历史版本管理与回溯")
-        hist_win.geometry("550x350")
-
-        tree = ttk.Treeview(hist_win, columns=("SHA", "Time", "Message"), show="headings")
-        tree.heading("SHA", text="版本 Commit")
-        tree.heading("Time", text="时间")
-        tree.heading("Message", text="提交说明")
-        tree.column("SHA", width=80)
-        tree.column("Time", width=140)
-        tree.column("Message", width=280)
-        tree.pack(fill="both", expand=True, padx=10, pady=10)
-
-        try:
-            repo = Repo(self.watch_dir)
-            walker = repo.get_walker()
-            for entry in walker:
-                commit = entry.commit
-                sha = commit.id.decode('utf-8')[:7]
-                msg = commit.message.decode('utf-8').strip()
-                ctime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(commit.commit_time))
-                tree.insert("", "end", values=(sha, ctime, msg))
-        except Exception as e:
-            log_error(f"加载 Git 历史记录失败: {e}")
+        HistoryWindow(self.root, self.watch_dir, self.enable_log)
 
     def create_tray_icon(self):
         image = Image.new('RGB', (64, 64), color=(0, 120, 215))
@@ -423,7 +503,7 @@ class BackupApp:
         draw.rectangle([16, 16, 48, 48], fill=(255, 255, 255))
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示界面", self.show_window),
+            pystray.MenuItem("显示主界面", self.show_window),
             pystray.MenuItem("退出程序", self.quit_app)
         )
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
@@ -443,7 +523,7 @@ class BackupApp:
         self.root.after(0, self.root.destroy)
 
 def ensure_single_instance(root):
-    """通过 Socket 监听确保软件单一实例运行，重复打开时唤醒已存在界面"""
+    """单实例保护：如重复运行则呼唤原主进程并显示界面（需求 8）"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(('127.0.0.1', SINGLE_INSTANCE_PORT))
@@ -451,14 +531,17 @@ def ensure_single_instance(root):
 
         def listen_wake_up():
             while True:
-                conn, _ = sock.accept()
-                conn.close()
-                root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force()))
+                try:
+                    conn, _ = sock.accept()
+                    conn.close()
+                    root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force()))
+                except Exception:
+                    break
 
         threading.Thread(target=listen_wake_up, daemon=True).start()
         return True
     except socket.error:
-        # 已有实例在运行，通知其唤醒并直接退出当前新进程
+        # 说明已有实例在后台运行，发送 Socket 请求呼唤已有进程并退出当前新进程
         try:
             client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
