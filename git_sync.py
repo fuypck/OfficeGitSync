@@ -1,699 +1,324 @@
 import os
 import sys
-import json
-import socket
-import threading
 import time
+import json
+import fnmatch
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageDraw
-import pystray
-
-# Windows 注册表库（仅在 Windows 环境使用）
-if sys.platform == "win32":
-    import winreg
-
+from tkinter import ttk, messagebox, filedialog
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from dulwich.repo import Repo
-from dulwich import porcelain
+import pystray
+from PIL import Image, ImageDraw
 
-# ==================== 0. 软件元数据配置 ====================
-APP_NAME = "WPS/Office Git文档管理工具"
-APP_VERSION = "0.1.1"
-APP_AUTHOR = "Ed Clack"
-APP_DESCRIPTION = "基于git的WPS/Office文档管理工具"
+APP_NAME = "OfficeGitSync"
+APP_VERSION = "0.1.2"
+CONFIG_FILE_NAME = ".officegitsync.json"
 
-CONFIG_FILE = "config.json"
-SINGLE_INSTANCE_PORT = 47829
-REG_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-REG_ITEM_NAME = "OfficeGitSync"
+# 默认内置的 Office/WPS 垃圾与临时文件过滤预设规则
+DEFAULT_EXCLUDE_PATTERNS = [
+    "~$*",       # Office/WPS 临时锁文件
+    "*.tmp",     # 临时文件
+    "*.bak",     # 自动备份文件
+    ".git/*",    # Git 核心版本库目录
+    "*.crdownload" # 浏览器未完成下载文件
+]
 
-# Office/WPS/Windows 常见临时文件与无关文件过滤
-IGNORED_PATTERNS_PREFIX = ('~$', '.~', '.~lock.', '.~tmp')
-IGNORED_PATTERNS_SUFFIX = ('.tmp', '.bak', '.old', '.log', '.swp', '.lock')
+class ConfigManager:
+    """管理项目根目录下的配置文件 (.officegitsync.json)"""
+    @staticmethod
+    def get_config_path(repo_dir):
+        return os.path.join(repo_dir, CONFIG_FILE_NAME)
 
-def is_ignored_file(file_name):
-    """判断是否为 Office/WPS 临时文件或隐藏锁文件"""
-    file_name_lower = file_name.lower()
-    if file_name.startswith(IGNORED_PATTERNS_PREFIX):
-        return True
-    if file_name_lower.endswith(IGNORED_PATTERNS_SUFFIX):
-        return True
-    if file_name == ".git" or file_name.startswith(".git/"):
-        return True
-    return False
-
-# ==================== 1. 开机自启与配置管理 ====================
-def set_autostart(enable=True):
-    """设置或取消 Windows 开机自启"""
-    if sys.platform != "win32":
-        return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY_PATH, 0, winreg.KEY_ALL_ACCESS)
-        if enable:
-            # 获取当前运行的 exe 或 py 路径，并加上 --minimized 参数
-            if getattr(sys, 'frozen', False):
-                exe_path = f'"{sys.executable}" --minimized'
-            else:
-                exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
-            winreg.SetValueEx(key, REG_ITEM_NAME, 0, winreg.REG_SZ, exe_path)
-        else:
+    @staticmethod
+    def load_config(repo_dir):
+        config_path = ConfigManager.get_config_path(repo_dir)
+        if os.path.exists(config_path):
             try:
-                winreg.DeleteValue(key, REG_ITEM_NAME)
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-        return True
-    except Exception as e:
-        print(f"[AutoStart Error] {e}")
-        return False
+                with open(config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"读取项目配置失败: {e}")
+        # 如果配置文件不存在，返回默认配置
+        return {
+            "debounce_seconds": 3,
+            "exclude_patterns": list(DEFAULT_EXCLUDE_PATTERNS)
+        }
 
-def check_autostart():
-    """检查是否已设置开机自启"""
-    if sys.platform != "win32":
-        return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY_PATH, 0, winreg.KEY_READ)
-        winreg.QueryValueEx(key, REG_ITEM_NAME)
-        winreg.CloseKey(key)
-        return True
-    except FileNotFoundError:
-        return False
-    except Exception:
-        return False
-
-def load_config():
-    default_config = {"monitored_folders": [], "debounce_seconds": 3, "autostart": False}
-    if os.path.exists(CONFIG_FILE):
+    @staticmethod
+    def save_config(repo_dir, config_data):
+        config_path = ConfigManager.get_config_path(repo_dir)
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                default_config.update(cfg)
-        except Exception:
-            pass
-    return default_config
-
-def save_config(config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-def normalize_path(path_str):
-    if not path_str:
-        return ""
-    return os.path.abspath(os.path.normpath(path_str))
-
-# ==================== 2. Git 逻辑封装 ====================
-def ensure_git_repo(folder_path):
-    folder_path = normalize_path(folder_path)
-    git_dir = os.path.join(folder_path, ".git")
-    if not os.path.exists(git_dir):
-        try:
-            Repo.init(folder_path)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            print(f"[Git Init Error] {e}")
-            return False
-    return True
-
-def get_folder_changed_files(folder_path):
-    folder_path = normalize_path(folder_path)
-    if not os.path.exists(os.path.join(folder_path, ".git")):
-        return []
-    
-    try:
-        r = Repo(folder_path)
-        status = porcelain.status(r)
-        
-        changed_files = set()
-        for _, files in status.staged.items():
-            for f in files:
-                fname = f.decode('utf-8', errors='ignore') if isinstance(f, bytes) else str(f)
-                changed_files.add(fname)
-                
-        for f in status.unstaged:
-            fname = f.decode('utf-8', errors='ignore') if isinstance(f, bytes) else str(f)
-            changed_files.add(fname)
-
-        for f in status.untracked:
-            fname = f.decode('utf-8', errors='ignore') if isinstance(f, bytes) else str(f)
-            changed_files.add(fname)
-
-        valid_changed_files = []
-        for f in changed_files:
-            base_name = os.path.basename(f)
-            if not is_ignored_file(base_name):
-                valid_changed_files.append(f)
-
-        return valid_changed_files
-    except Exception as e:
-        print(f"[Git Status Error] {e}")
-        return []
-
-def commit_folder_changes(folder_path, changed_files, message):
-    folder_path = normalize_path(folder_path)
-    try:
-        r = Repo(folder_path)
-        if not changed_files:
+            print(f"写入项目配置失败: {e}")
             return False
 
-        porcelain.add(r, paths=changed_files)
-        
-        if not message.strip():
-            message = f"自动备份变更文件: {', '.join([os.path.basename(f) for f in changed_files[:3]])}"
-            if len(changed_files) > 3:
-                message += f" 等{len(changed_files)}个文件"
-
-        porcelain.commit(r, message=message.encode("utf-8"), committer=f"{APP_AUTHOR} <backup@local>".encode("utf-8"))
-        return True
-    except Exception as e:
-        print(f"[Git Commit Error] {e}")
-        return False
-
-def get_git_history(folder_path):
-    folder_path = normalize_path(folder_path)
-    git_dir = os.path.join(folder_path, ".git")
-    if not os.path.exists(git_dir):
-        return []
-    try:
-        r = Repo(folder_path)
-        logs = []
-        try:
-            walker = r.get_walker(max_entries=100)
-            for entry in walker:
-                commit = entry.commit
-                raw_hash = commit.id.decode("utf-8")
-                commit_time_struct = time.localtime(commit.commit_time)
-                
-                commit_time = time.strftime("%Y-%m-%d %H:%M:%S", commit_time_struct)
-                timestamp_id = "V" + time.strftime("%Y%m%d_%H%M%S", commit_time_struct)
-                
-                msg = commit.message.decode("utf-8", errors="ignore").strip()
-                logs.append({
-                    "raw_hash": raw_hash,
-                    "display_id": timestamp_id,
-                    "date": commit_time,
-                    "msg": msg
-                })
-        except KeyError:
-            pass
-        return logs
-    except Exception as e:
-        print(f"[Git Log Error] {e}")
-        return []
-
-def restore_commit_safely(folder_path, commit_hash):
-    folder_path = normalize_path(folder_path)
-    try:
-        r = Repo(folder_path)
-        target_commit_bytes = commit_hash.encode("utf-8")
-        
-        target_commit = r[target_commit_bytes]
-        tree_id = target_commit.tree
-
-        r.reset_index(tree_id)
-        porcelain.reset(r, mode="hard", treeish=target_commit_bytes)
-        
-        restore_msg = f"🔄 还原文档状态至历史版本 [{commit_hash[:7]}]"
-        porcelain.add(r, paths=".")
-        porcelain.commit(r, message=restore_msg.encode("utf-8"), committer=f"{APP_AUTHOR} <backup@local>".encode("utf-8"))
-        return True
-    except Exception as e:
-        print(f"[Git Restore Error] {e}")
-        return False
-
-# ==================== 3. Watchdog 事件监听 ====================
-class OfficeFileEventHandler(FileSystemEventHandler):
-    def __init__(self, folder_path, change_callback):
+class GitDebounceHandler(FileSystemEventHandler):
+    """带防抖与动态通配符过滤功能的 Watchdog 事件监听器"""
+    def __init__(self, repo_dir, debounce_seconds=3, exclude_patterns=None):
         super().__init__()
-        self.folder_path = folder_path
-        self.change_callback = change_callback
+        self.repo_dir = repo_dir
+        self.debounce_seconds = debounce_seconds
+        self.exclude_patterns = exclude_patterns or list(DEFAULT_EXCLUDE_PATTERNS)
+        self.timer = None
+        self.lock = threading.Lock()
+        self.repo = Repo.init(repo_dir)
+
+    def is_excluded(self, path):
+        """检查路径是否命中排除列表（相对路径匹配）"""
+        rel_path = os.path.relpath(path, self.repo_dir).replace("\\", "/")
+        filename = os.path.basename(path)
+
+        # 忽视配置文件本身以及 .git 目录内变更
+        if filename == CONFIG_FILE_NAME or rel_path.startswith(".git"):
+            return True
+
+        for pattern in self.exclude_patterns:
+            # 支持对文件名或完整相对路径的匹配
+            if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(rel_path, pattern):
+                return True
+        return False
 
     def on_any_event(self, event):
         if event.is_directory:
             return
         
-        filename = os.path.basename(event.src_path)
-        if is_ignored_file(filename):
+        # 排除检测
+        if self.is_excluded(event.src_path):
             return
 
-        self.change_callback(self.folder_path)
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            self.timer = threading.Timer(self.debounce_seconds, self.commit_changes)
+            self.timer.start()
 
-class WatchdogDaemon:
-    def __init__(self, root, start_minimized=False):
+    def commit_changes(self):
+        with self.lock:
+            try:
+                # 使用 Dulwich 自动阶段化并提交变动
+                status = self.repo.status()
+                has_changes = any([status.unstaged, status.staged.get('add'), status.staged.get('delete'), status.staged.get('modify')])
+                
+                # 手动添加未追踪文件与改动文件
+                self.repo.stage(list(self.get_untracked_files()))
+                
+                commit_msg = f"Auto-backup: {time.strftime('%Y-%m-%d %H:%M:%S')}".encode('utf-8')
+                self.repo.do_commit(commit_msg, committer=b"OfficeGitSync <backup@local>")
+                print(f"[{time.strftime('%H:%M:%S')}] 自动备份完成")
+            except Exception as e:
+                print(f"提交备份失败: {e}")
+
+    def get_untracked_files(self):
+        """获取当前工作区中未排除的文件列表"""
+        untracked = []
+        for root, dirs, files in os.walk(self.repo_dir):
+            # 跳过 .git 目录
+            if ".git" in dirs:
+                dirs.remove(".git")
+            for file in files:
+                full_path = os.path.join(root, file)
+                if not self.is_excluded(full_path):
+                    rel_path = os.path.relpath(full_path, self.repo_dir)
+                    untracked.append(rel_path)
+        return untracked
+
+class BackupApp:
+    def __init__(self, root):
         self.root = root
-        self.config = load_config()
-        self.observer = Observer()
-        self.is_popup_open = False
-        self.start_minimized = start_minimized
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        self.root.geometry("600x520")
         
-        self.pending_folders = set()
-        self.debounce_timer = None
-        self.lock = threading.Lock()
+        self.observer = None
+        self.event_handler = None
+        self.watch_dir = ""
+        self.exclude_patterns = list(DEFAULT_EXCLUDE_PATTERNS)
 
-        self.main_win = MainWindow(self.root, self.config, self.restart_monitoring)
+        self.setup_ui()
         self.create_tray_icon()
 
-    def on_folder_changed(self, folder_path):
-        if self.is_popup_open:
+    def setup_ui(self):
+        # 1. 目录选择区域
+        dir_frame = ttk.LabelFrame(self.root, text=" 工作目录设置 ", padding=10)
+        dir_frame.pack(fill="x", padx=10, pady=5)
+
+        self.dir_entry = ttk.Entry(dir_frame)
+        self.dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        
+        btn_browse = ttk.Button(dir_frame, text="浏览...", command=self.browse_directory)
+        btn_browse.pack(side="right")
+
+        # 2. 排除规则设置区域
+        exclude_frame = ttk.LabelFrame(self.root, text=" 文件排除/过滤规则 (独立于当前目录) ", padding=10)
+        exclude_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # 预设快速勾选框
+        preset_frame = ttk.Frame(exclude_frame)
+        preset_frame.pack(fill="x", pady=(0, 5))
+        
+        self.var_office_lock = tk.BooleanVar(value=True)
+        chk_office = ttk.Checkbutton(preset_frame, text="过滤 Office/WPS 临时文件 (~$*, *.tmp, *.bak)", 
+                                     variable=self.var_office_lock, command=self.toggle_preset_rules)
+        chk_office.pack(side="left")
+
+        # 规则列表框 + 滚动条
+        list_frame = ttk.Frame(exclude_frame)
+        list_frame.pack(fill="both", expand=True, pady=5)
+
+        self.pattern_listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, height=6)
+        self.pattern_listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.pattern_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.pattern_listbox.config(yscrollcommand=scrollbar.set)
+
+        # 添加与删除规则控制栏
+        ctrl_frame = ttk.Frame(exclude_frame)
+        ctrl_frame.pack(fill="x", pady=(5, 0))
+
+        self.new_pattern_entry = ttk.Entry(ctrl_frame)
+        self.new_pattern_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.new_pattern_entry.insert(0, "*.pdf") # 默认提示示例
+
+        btn_add = ttk.Button(ctrl_frame, text="添加规则", command=self.add_pattern)
+        btn_add.pack(side="left", padx=2)
+
+        btn_del = ttk.Button(ctrl_frame, text="删除选中", command=self.remove_pattern)
+        btn_del.pack(side="left", padx=2)
+
+        # 3. 防抖与控制按钮区域
+        btn_frame = ttk.Frame(self.root, padding=10)
+        btn_frame.pack(fill="x", padx=10)
+
+        self.btn_toggle = ttk.Button(btn_frame, text="开启无感自动备份", command=self.toggle_monitoring)
+        self.btn_toggle.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.lbl_status = ttk.Label(self.root, text="状态: 未运行", foreground="gray")
+        self.lbl_status.pack(pady=5)
+
+    def update_listbox(self):
+        """刷新 UI 中的规则列表"""
+        self.pattern_listbox.delete(0, tk.END)
+        for pattern in self.exclude_patterns:
+            self.pattern_listbox.insert(tk.END, pattern)
+
+    def browse_directory(self):
+        selected_dir = filedialog.askdirectory()
+        if selected_dir:
+            self.watch_dir = selected_dir
+            self.dir_entry.delete(0, tk.END)
+            self.dir_entry.insert(0, selected_dir)
+            
+            # 读取该目录专属的配置文件
+            config = ConfigManager.load_config(selected_dir)
+            self.exclude_patterns = config.get("exclude_patterns", list(DEFAULT_EXCLUDE_PATTERNS))
+            self.update_listbox()
+
+    def toggle_preset_rules(self):
+        """处理预设勾选框状态变动"""
+        presets = ["~$*", "*.tmp", "*.bak"]
+        if self.var_office_lock.get():
+            for p in presets:
+                if p not in self.exclude_patterns:
+                    self.exclude_patterns.append(p)
+        else:
+            self.exclude_patterns = [p for p in self.exclude_patterns if p not in presets]
+        self.update_listbox()
+        self.save_current_config()
+
+    def add_pattern(self):
+        new_pattern = self.new_pattern_entry.get().strip()
+        if new_pattern and new_pattern not in self.exclude_patterns:
+            self.exclude_patterns.append(new_pattern)
+            self.update_listbox()
+            self.new_pattern_entry.delete(0, tk.END)
+            self.save_current_config()
+
+    def remove_pattern(self):
+        selected_indices = self.pattern_listbox.curselection()
+        if selected_indices:
+            idx = selected_indices[0]
+            removed = self.exclude_patterns.pop(idx)
+            self.update_listbox()
+            self.save_current_config()
+
+    def save_current_config(self):
+        """将当前的排除规则写入当前目录的 .officegitsync.json"""
+        if self.watch_dir and os.path.exists(self.watch_dir):
+            config_data = {
+                "version": APP_VERSION,
+                "debounce_seconds": 3,
+                "exclude_patterns": self.exclude_patterns
+            }
+            ConfigManager.save_config(self.watch_dir, config_data)
+
+    def toggle_monitoring(self):
+        if self.observer and self.observer.is_alive():
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+
+    def start_monitoring(self):
+        self.watch_dir = self.dir_entry.get().strip()
+        if not self.watch_dir or not os.path.exists(self.watch_dir):
+            messagebox.showerror("错误", "请选择有效的备份工作目录！")
             return
 
-        with self.lock:
-            self.pending_folders.add(folder_path)
-            if self.debounce_timer:
-                self.debounce_timer.cancel()
+        # 启动前保存当前规则配置
+        self.save_current_config()
 
-            debounce_seconds = self.config.get("debounce_seconds", 3)
-            self.debounce_timer = threading.Timer(debounce_seconds, self.trigger_popup)
-            self.debounce_timer.start()
-
-    def trigger_popup(self):
-        with self.lock:
-            if not self.pending_folders or self.is_popup_open:
-                return
-            folders_to_check = list(self.pending_folders)
-            self.pending_folders.clear()
-
-        def check_status_in_background():
-            folder_changes_map = {}
-            for folder in folders_to_check:
-                changed_files = get_folder_changed_files(folder)
-                if changed_files:
-                    folder_changes_map[folder] = changed_files
-
-            if folder_changes_map:
-                self.is_popup_open = True
-                self.root.after(0, lambda: CombinedCommitWindow(
-                    self.root, folder_changes_map, on_close_callback=self.on_popup_closed
-                ))
-
-        threading.Thread(target=check_status_in_background, daemon=True).start()
-
-    def on_popup_closed(self):
-        self.is_popup_open = False
-        self.root.after(0, lambda: self.main_win.load_history(None))
-
-    def restart_monitoring(self, new_config=None):
-        if new_config:
-            self.config = new_config
-
-        if self.observer.is_alive():
-            self.observer.stop()
-            self.observer.join()
-
+        self.event_handler = GitDebounceHandler(
+            repo_dir=self.watch_dir,
+            debounce_seconds=3,
+            exclude_patterns=self.exclude_patterns
+        )
         self.observer = Observer()
-        for folder in self.config.get("monitored_folders", []):
-            norm_f = normalize_path(folder)
-            if os.path.exists(norm_f):
-                ensure_git_repo(norm_f)
-                handler = OfficeFileEventHandler(norm_f, self.on_folder_changed)
-                self.observer.schedule(handler, norm_f, recursive=True)
-
+        self.observer.schedule(self.event_handler, self.watch_dir, recursive=True)
         self.observer.start()
 
+        self.btn_toggle.config(text="停止自动备份")
+        self.lbl_status.config(text=f"状态: 正在实时监控 [{os.path.basename(self.watch_dir)}]", foreground="green")
+
+    def stop_monitoring(self):
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+            self.observer = None
+        self.btn_toggle.config(text="开启无感自动备份")
+        self.lbl_status.config(text="状态: 已停止", foreground="gray")
+
     def create_tray_icon(self):
-        image = Image.new('RGB', (64, 64), color=(30, 144, 255))
-        d = ImageDraw.Draw(image)
-        d.text((18, 20), "Git", fill=(255, 255, 255))
-
-        def open_ui(icon, item):
-            self.root.after(0, self.main_win.show)
-
-        def on_exit(icon, item):
-            if self.observer.is_alive():
-                self.observer.stop()
-            icon.stop()
-            self.root.after(0, self.root.destroy)
+        # 创建默认系统托盘图标
+        image = Image.new('RGB', (64, 64), color=(73, 109, 137))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([16, 16, 48, 48], fill=(255, 255, 255))
 
         menu = pystray.Menu(
-            pystray.MenuItem("💻 打开主控制台", open_ui),
-            pystray.MenuItem("❌ 退出程序", on_exit)
+            pystray.MenuItem("显示界面", self.show_window),
+            pystray.MenuItem("退出程序", self.quit_app)
         )
-
-        self.tray_icon = pystray.Icon("OfficeGitSync", image, APP_DESCRIPTION, menu)
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
-    def start(self):
-        self.restart_monitoring()
-        if not self.start_minimized:
-            self.main_win.show()
+        self.root.protocol('WM_DELETE_WINDOW', self.hide_window)
 
-# ==================== 4. UI 界面 ====================
-class CombinedCommitWindow:
-    def __init__(self, parent_root, folder_changes_map, on_close_callback=None):
-        self.folder_changes_map = folder_changes_map
-        self.on_close_callback = on_close_callback
-        self.entries = {}
-        
-        self.top = tk.Toplevel(parent_root)
-        self.top.title("📝 文档变更自动备份提交")
-        self.top.geometry("680x520")
-        self.top.attributes("-topmost", True)
-        self.top.protocol("WM_DELETE_WINDOW", self.on_cancel)
-        
-        header_frame = ttk.Frame(self.top, padding=10)
-        header_frame.pack(fill="x")
-        ttk.Label(header_frame, text="检测到以下文件已更新，请确认并提交备份：", font=("Microsoft YaHei", 10, "bold")).pack(anchor="w")
-
-        batch_frame = ttk.LabelFrame(self.top, text=" 快捷操作 ", padding=10)
-        batch_frame.pack(fill="x", padx=10, pady=5)
-        
-        ttk.Label(batch_frame, text="统一备注:").pack(side="left", padx=5)
-        self.batch_entry = ttk.Entry(batch_frame)
-        self.batch_entry.pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Button(batch_frame, text="应用到所有选中", command=self.apply_batch_message).pack(side="right", padx=5)
-
-        list_container = ttk.Frame(self.top, padding=10)
-        list_container.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(list_container, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = ttk.Frame(canvas)
-
-        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        for folder, files in self.folder_changes_map.items():
-            self.create_folder_card(folder, files)
-
-        self.bottom_frame = ttk.Frame(self.top, padding=10)
-        self.bottom_frame.pack(fill="x")
-        
-        self.btn_submit = ttk.Button(self.bottom_frame, text="提交选中的变动", command=self.on_submit)
-        self.btn_submit.pack(side="right", padx=5)
-        ttk.Button(self.bottom_frame, text="暂不提交 (跳过)", command=self.on_cancel).pack(side="right", padx=5)
-
-    def create_folder_card(self, folder, files):
-        card = ttk.LabelFrame(self.scrollable_frame, text=f" 📁 目录: {folder} ", padding=8)
-        card.pack(fill="x", expand=True, pady=5, padx=5)
-
-        var_check = tk.BooleanVar(value=True)
-        chk = ttk.Checkbutton(card, text="提交此目录", variable=var_check)
-        chk.grid(row=0, column=0, sticky="w", padx=5)
-
-        ttk.Label(card, text="备注:").grid(row=0, column=1, sticky="w", padx=5)
-        entry = ttk.Entry(card, width=40)
-        
-        default_msg = f"修改了: {', '.join([os.path.basename(f) for f in files[:2]])}"
-        if len(files) > 2:
-            default_msg += f" 等{len(files)}个文件"
-        entry.insert(0, default_msg)
-        entry.grid(row=0, column=2, sticky="ew", padx=5)
-
-        files_frame = ttk.Frame(card, padding=(5, 5, 5, 0))
-        files_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
-        
-        ttk.Label(files_frame, text="变动文件清单:", font=("Microsoft YaHei", 8, "bold"), foreground="gray").pack(anchor="w")
-        for f in files:
-            ttk.Label(files_frame, text=f"  📄 {f}", font=("Microsoft YaHei", 8), foreground="#333333").pack(anchor="w")
-
-        card.columnconfigure(2, weight=1)
-        self.entries[folder] = {"check": var_check, "entry": entry, "files": files}
-
-    def apply_batch_message(self):
-        msg = self.batch_entry.get().strip()
-        if msg:
-            for item in self.entries.values():
-                if item["check"].get():
-                    item["entry"].delete(0, tk.END)
-                    item["entry"].insert(0, msg)
-
-    def on_submit(self):
-        self.btn_submit.config(state="disabled", text="正在提交备份中...")
-
-        def do_commit_in_background():
-            success_count = 0
-            for folder, controls in self.entries.items():
-                if controls["check"].get():
-                    msg = controls["entry"].get().strip()
-                    files = controls["files"]
-                    if commit_folder_changes(folder, files, msg):
-                        success_count += 1
-
-            def on_finished():
-                messagebox.showinfo("完成", f"成功完成 {success_count} 个文件夹的备份提交！", parent=self.top)
-                self.close_window()
-
-            self.top.after(0, on_finished)
-
-        threading.Thread(target=do_commit_in_background, daemon=True).start()
-
-    def on_cancel(self):
-        self.close_window()
-
-    def close_window(self):
-        if self.on_close_callback:
-            self.on_close_callback()
-        self.top.destroy()
-
-class MainWindow:
-    def __init__(self, root, config, on_config_change_cb):
-        self.root = root
-        self.config = config
-        self.on_config_change_cb = on_config_change_cb
-        self.sort_reverse = {}
-
-        self.root.title(f"{APP_NAME} v{APP_VERSION} - By {APP_AUTHOR}")
-        self.root.geometry("750x540")
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
-
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.tab_settings = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_settings, text=" ⚙️ 监控目录设置 ")
-        self.setup_settings_tab()
-
-        self.tab_history = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_history, text=" 📜 历史版本查看与恢复 ")
-        self.setup_history_tab()
-
-    def setup_settings_tab(self):
-        ttk.Label(self.tab_settings, text="已监控的工作文件夹列表（包含深层子目录）：", font=("Microsoft YaHei", 9, "bold")).pack(anchor="w", pady=(0, 5))
-
-        list_frame = ttk.Frame(self.tab_settings)
-        list_frame.pack(fill="both", expand=True)
-
-        self.listbox = tk.Listbox(list_frame, selectmode="single")
-        self.listbox.pack(side="left", fill="both", expand=True)
-
-        for f in self.config.get("monitored_folders", []):
-            self.listbox.insert(tk.END, f)
-
-        btn_frame = ttk.Frame(list_frame, padding=5)
-        btn_frame.pack(side="right", fill="y")
-
-        ttk.Button(btn_frame, text="添加文件夹", command=self.add_folder).pack(fill="x", pady=5)
-        ttk.Button(btn_frame, text="移除选中", command=self.remove_folder).pack(fill="x", pady=5)
-
-        # 选项区域：开机自启
-        opt_frame = ttk.LabelFrame(self.tab_settings, text=" 系统选项 ", padding=10)
-        opt_frame.pack(fill="x", pady=(10, 0))
-
-        self.autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
-        ttk.Checkbutton(
-            opt_frame, 
-            text="开机自动启动（后台静默运行到系统托盘）", 
-            variable=self.autostart_var
-        ).pack(anchor="w")
-
-        bottom = ttk.Frame(self.tab_settings, padding=(0, 10, 0, 0))
-        bottom.pack(fill="x")
-        
-        info_label = ttk.Label(bottom, text=f"版本: v{APP_VERSION} | 作者: {APP_AUTHOR}", foreground="gray")
-        info_label.pack(side="left")
-
-        ttk.Button(bottom, text="保存设置并生效", command=self.save_settings).pack(side="right")
-
-    def setup_history_tab(self):
-        top_frame = ttk.Frame(self.tab_history)
-        top_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(top_frame, text="选择要查看的工作文件夹：").pack(side="left", padx=5)
-        self.folder_cb = ttk.Combobox(top_frame, values=self.config.get("monitored_folders", []), state="readonly", width=50)
-        self.folder_cb.pack(side="left", fill="x", expand=True, padx=5)
-        self.folder_cb.bind("<<ComboboxSelected>>", self.load_history)
-
-        table_frame = ttk.Frame(self.tab_history)
-        table_frame.pack(fill="both", expand=True)
-
-        columns = ("display_id", "date", "msg")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        
-        self.columns_config = {
-            "display_id": "版本ID (时间戳)",
-            "date": "提交时间",
-            "msg": "提交备注说明"
-        }
-        
-        for col, title in self.columns_config.items():
-            self.tree.heading(col, text=f"{title} ↕", command=lambda c=col: self.sort_column(c))
-            self.sort_reverse[col] = False
-
-        self.tree.column("display_id", width=160, anchor="center")
-        self.tree.column("date", width=160, anchor="center")
-        self.tree.column("msg", width=320, anchor="w")
-
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        bottom_frame = ttk.Frame(self.tab_history, padding=(0, 10, 0, 0))
-        bottom_frame.pack(fill="x")
-
-        ttk.Button(bottom_frame, text="刷新列表", command=lambda: self.load_history(None)).pack(side="left", padx=5)
-        ttk.Button(bottom_frame, text="恢复当前目录到所选历史版本", command=self.restore_selected).pack(side="right", padx=5)
-        
-        folders = self.config.get("monitored_folders", [])
-        if folders:
-            self.folder_cb.current(0)
-            self.load_history(None)
-
-    def sort_column(self, col):
-        items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        reverse = not self.sort_reverse[col]
-        self.sort_reverse[col] = reverse
-
-        items.sort(reverse=reverse)
-
-        for index, (val, k) in enumerate(items):
-            self.tree.move(k, '', index)
-
-        for c, title in self.columns_config.items():
-            if c == col:
-                arrow = " ▲" if not reverse else " ▼"
-                self.tree.heading(c, text=f"{title}{arrow}")
-            else:
-                self.tree.heading(c, text=f"{title} ↕")
-
-    def add_folder(self):
-        folder = filedialog.askdirectory(parent=self.root, title="选择要监控的工作文件夹")
-        if folder:
-            folder = normalize_path(folder)
-            if folder not in self.listbox.get(0, tk.END):
-                self.listbox.insert(tk.END, folder)
-                ensure_git_repo(folder)
-
-    def remove_folder(self):
-        selected = self.listbox.curselection()
-        if selected:
-            self.listbox.delete(selected[0])
-
-    def save_settings(self):
-        folders = [normalize_path(f) for f in self.listbox.get(0, tk.END)]
-        for f in folders:
-            ensure_git_repo(f)
-        
-        autostart_enable = self.autostart_var.get()
-        set_autostart(autostart_enable)
-
-        self.config["monitored_folders"] = folders
-        self.config["autostart"] = autostart_enable
-        save_config(self.config)
-
-        self.folder_cb["values"] = folders
-        if folders:
-            self.folder_cb.current(0)
-            self.load_history(None)
-        if self.on_config_change_cb:
-            self.on_config_change_cb(self.config)
-        messagebox.showinfo("成功", "监控目录与系统选项保存成功！", parent=self.root)
-
-    def load_history(self, event):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        selected_folder = self.folder_cb.get()
-        if not selected_folder:
-            return
-        logs = get_git_history(selected_folder)
-        for log in logs:
-            self.tree.insert("", tk.END, text=log["raw_hash"], values=(log["display_id"], log["date"], log["msg"]))
-
-    def restore_selected(self):
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("提示", "请先在列表中选中一个要恢复的历史版本！", parent=self.root)
-            return
-
-        commit_hash = self.tree.item(selected_item[0], "text")
-        item_values = self.tree.item(selected_item[0], "values")
-        display_id, commit_date, commit_msg = item_values[0], item_values[1], item_values[2]
-        selected_folder = self.folder_cb.get()
-
-        confirm = messagebox.askyesno(
-            "安全还原提示",
-            f"您确定要将文件夹：\n{selected_folder}\n\n还原到以下历史版本吗？\n"
-            f"版本ID：{display_id}\n时间：{commit_date}\n备注：{commit_msg}\n\n"
-            f"✅ 提示：系统将以【追加备份】的方式还原文件，现有的所有 Commit 历史均会完整保留，不会丢失！",
-            parent=self.root
-        )
-
-        if confirm:
-            if restore_commit_safely(selected_folder, commit_hash):
-                messagebox.showinfo("成功", f"文件已恢复至版本 [{display_id}] 的状态！并已自动创建还原记录节点。", parent=self.root)
-                self.load_history(None)
-            else:
-                messagebox.showerror("错误", "恢复历史版本失败！", parent=self.root)
-
-    def show(self):
-        folders = self.config.get("monitored_folders", [])
-        self.folder_cb["values"] = folders
-        if folders and not self.folder_cb.get():
-            self.folder_cb.current(0)
-            self.load_history(None)
-        self.root.deiconify()
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-topmost", False)
-
-    def hide_to_tray(self):
+    def hide_window(self):
         self.root.withdraw()
 
-# ==================== 5. 单实例通信与启动 ====================
-def start_single_instance_listener(root, daemon):
-    def listener():
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            server.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
-            server.listen(5)
-            while True:
-                conn, _ = server.accept()
-                msg = conn.recv(1024).decode("utf-8")
-                if msg == "WAKE_UP":
-                    root.after(0, daemon.main_win.show)
-                conn.close()
-        except Exception:
-            pass
+    def show_window(self, icon=None, item=None):
+        self.root.after(0, self.root.deiconify)
 
-    threading.Thread(target=listener, daemon=True).start()
-
-def try_notify_existing_instance():
-    try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client.settimeout(1.0)
-        client.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
-        client.sendall(b"WAKE_UP")
-        client.close()
-        return True
-    except Exception:
-        return False
+    def quit_app(self, icon=None, item=None):
+        self.stop_monitoring()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
 
 if __name__ == "__main__":
-    start_minimized = "--minimized" in sys.argv
-
-    if try_notify_existing_instance():
-        sys.exit(0)
-
     root = tk.Tk()
-    root.withdraw()  # 默认先隐藏主窗口
-
-    daemon = WatchdogDaemon(root, start_minimized=start_minimized)
-    start_single_instance_listener(root, daemon)
-    daemon.start()
-
+    app = BackupApp(root)
     root.mainloop()
