@@ -742,42 +742,68 @@ class BackupApp:
             self.tray_icon.stop()
         self.root.after(0, self.root.destroy)
 
+# 保留一个全局引用，防止监听 socket 被 Python 垃圾回收提前关闭
+_instance_server_sock = None
+
+def wake_up_window(root):
+    """确保窗口从最小化、隐藏或托盘状态还原并强行置顶激活"""
+    root.deiconify()
+    root.state('normal')
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after_idle(root.attributes, "-topmost", False)
+    root.focus_force()
+
 def ensure_single_instance(root):
-    """尝试唤醒已运行实例；固定端口不可用且无人应答时，不误退出程序。"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    global _instance_server_sock
+
+    # 1. 先尝试连接端口，看是否已有正在运行的实例
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
-        sock.listen(5)
+        client.settimeout(0.5)
+        client.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        # 连接成功，发送唤醒指令并关闭
+        try:
+            client.sendall(b"WAKE_UP\n")
+        except Exception:
+            pass
+        finally:
+            client.close()
+        # 已有实例在运行，直接返回 False 退出当前程序
+        return False
+    except (OSError, socket.error):
+        # 无法连接，说明目前没有正常运行的实例在监听此端口
+        client.close()
+
+    # 2. 尝试作为主实例进行绑定和监听（严禁加 SO_REUSEADDR！）
+    _instance_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _instance_server_sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        _instance_server_sock.listen(5)
 
         def listen_wake_up():
             while True:
                 try:
-                    conn, _ = sock.accept()
+                    conn, _ = _instance_server_sock.accept()
+                    # 收到重复启动的连接时，在主线程唤醒窗口
+                    root.after(0, lambda: wake_up_window(root))
                     conn.close()
-                    root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force()))
                 except Exception:
                     break
 
-        threading.Thread(target=listen_wake_up, daemon=True).start()
+        t = threading.Thread(target=listen_wake_up, daemon=True)
+        t.start()
         return True
-    except OSError as bind_error:
-        sock.close()
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as e:
+        # 如果连不上且绑不上（端口被其他非本软件的程序占用），做容错处理让程序继续运行
         try:
-            client.settimeout(0.5)
-            client.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
-            client.close()
-            # 确认端口上已有实例响应，才认为程序已经运行。
-            return False
-        except OSError:
-            client.close()
-            # 端口可能被其他软件占用；此时继续运行，不能直接退出。
-            try:
-                log_message(f"单实例端口 {SINGLE_INSTANCE_PORT} 被占用，但没有 OfficeGitSync 实例响应: {bind_error}")
-            except Exception:
-                pass
-            return True
+            _instance_server_sock.close()
+        except Exception:
+            pass
+        _instance_server_sock = None
+        log_message(f"单实例端口 {SINGLE_INSTANCE_PORT} 绑定失败: {e}")
+        return True
+
 
 if __name__ == "__main__":
     root = tk.Tk()
