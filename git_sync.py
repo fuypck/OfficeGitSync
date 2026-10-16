@@ -28,7 +28,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 APP_NAME = "OfficeGitSync"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 APP_AUTHOR = "Ed Clack"
 APP_URL = "https://github.com/fuypck/OfficeGitSync"
 CONFIG_FILE_NAME = ".officegitsync.json"
@@ -41,6 +41,67 @@ DEFAULT_EXCLUDE_PATTERNS = [
     ".git/*",    # Git 核心目录
     "*.crdownload"
 ]
+
+
+def _decode_path(path):
+    """将 Dulwich 返回的路径统一为 Git 使用的相对 POSIX 路径。"""
+    if isinstance(path, bytes):
+        path = path.decode("utf-8", errors="replace")
+    normalized = str(path).replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _status_paths(status):
+    """提取 Git 状态中的所有路径，兼容 Dulwich 不同版本的状态结构。"""
+    staged = getattr(status, "staged", {}) or {}
+    paths = set()
+    for values in staged.values():
+        for path in values or []:
+            paths.add(_decode_path(path))
+
+    for attr in ("unstaged", "untracked"):
+        values = getattr(status, attr, []) or []
+        # Dulwich 的 unstaged/untracked 通常是路径列表；兼容字典结构。
+        if isinstance(values, dict):
+            iterable = []
+            for group in values.values():
+                iterable.extend(group or [])
+        else:
+            iterable = values
+        for path in iterable:
+            paths.add(_decode_path(path))
+    return paths
+
+
+def get_changed_files(repo_dir, enable_log=False, exclude_patterns=None, candidate_paths=None):
+    """返回 Git 确认存在变更的文件；若给出候选路径，只返回本轮文件事件涉及的路径。"""
+    try:
+        status = porcelain.status(repo_dir)
+        found = _status_paths(status)
+
+        if candidate_paths is not None:
+            candidates = {_decode_path(path) for path in candidate_paths if path}
+            found.intersection_update(candidates)
+
+        patterns = list(DEFAULT_EXCLUDE_PATTERNS)
+        if exclude_patterns:
+            patterns.extend(exclude_patterns)
+
+        result = []
+        for rel_path in sorted(found, key=str.lower):
+            normalized = _decode_path(rel_path)
+            filename = os.path.basename(normalized)
+            if normalized == ".git" or normalized.startswith(".git/"):
+                continue
+            if any(fnmatch.fnmatch(filename, pat) or fnmatch.fnmatch(normalized, pat) for pat in patterns):
+                continue
+            result.append(normalized)
+        return result
+    except Exception as e:
+        log_message(f"读取 Git 变更状态失败: {e}", enable_log)
+        return []
 
 def get_app_dir():
     """获取软件本体可执行文件所在的真实路径（确保日志和配置只存本体目录）"""
@@ -98,23 +159,25 @@ class AppConfigManager:
             return False
 
 class GitDebounceHandler(FileSystemEventHandler):
-    """带防抖与文件匹配过滤的 Watchdog 监听器"""
+    """防抖监听器：只把本轮真实文件事件对应的路径交给 Git 状态检查。"""
     def __init__(self, repo_dir, debounce_seconds=3, exclude_patterns=None, trigger_callback=None):
         super().__init__()
-        self.repo_dir = repo_dir
+        self.repo_dir = os.path.abspath(repo_dir)
         self.debounce_seconds = debounce_seconds
         self.exclude_patterns = exclude_patterns or list(DEFAULT_EXCLUDE_PATTERNS)
         self.trigger_callback = trigger_callback
         self.timer = None
         self.lock = threading.Lock()
+        self.pending_paths = set()
 
     def is_excluded(self, path):
-        rel_path = os.path.relpath(path, self.repo_dir).replace("\\", "/")
-        filename = os.path.basename(path)
-
-        if rel_path.startswith(".git"):
+        try:
+            rel_path = os.path.relpath(os.path.abspath(path), self.repo_dir).replace("\\", "/")
+        except ValueError:
             return True
-
+        filename = os.path.basename(path)
+        if rel_path == ".git" or rel_path.startswith(".git/") or rel_path.startswith("../"):
+            return True
         for pattern in self.exclude_patterns:
             if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(rel_path, pattern):
                 return True
@@ -123,18 +186,41 @@ class GitDebounceHandler(FileSystemEventHandler):
     def on_any_event(self, event):
         if event.is_directory:
             return
-        if self.is_excluded(event.src_path):
+
+        event_paths = [getattr(event, "src_path", None)]
+        # 移动/重命名事件同时检查旧路径和新路径。
+        dest_path = getattr(event, "dest_path", None)
+        if dest_path:
+            event_paths.append(dest_path)
+
+        paths = set()
+        for path in event_paths:
+            if not path or self.is_excluded(path):
+                continue
+            try:
+                rel_path = os.path.relpath(os.path.abspath(path), self.repo_dir).replace("\\", "/")
+            except ValueError:
+                continue
+            if rel_path and rel_path != "." and not rel_path.startswith("../"):
+                paths.add(_decode_path(rel_path))
+        if not paths:
             return
 
         with self.lock:
+            self.pending_paths.update(paths)
             if self.timer:
                 self.timer.cancel()
             self.timer = threading.Timer(self.debounce_seconds, self.on_debounce_success)
+            self.timer.daemon = True
             self.timer.start()
 
     def on_debounce_success(self):
-        if self.trigger_callback:
-            self.trigger_callback()
+        with self.lock:
+            paths = set(self.pending_paths)
+            self.pending_paths.clear()
+            self.timer = None
+        if paths and self.trigger_callback:
+            self.trigger_callback(paths)
 
 class CommitDialog(tk.Toplevel):
     """文件变更自动弹出的 Commit 对话框"""
@@ -180,11 +266,71 @@ class CommitDialog(tk.Toplevel):
             messagebox.showwarning("提示", "请输入备份说明！", parent=self)
             return
         try:
-            porcelain.add(self.repo_dir, self.changed_files)
+            selected = {_decode_path(path) for path in self.changed_files}
+            current_files = get_changed_files(
+                self.repo_dir, self.enable_log, candidate_paths=selected
+            )
+            paths = [path for path in current_files if path in selected]
+            if not paths:
+                messagebox.showinfo("无需提交", "这些文件目前没有 Git 变更，无需提交。", parent=self)
+                self.destroy()
+                return
+
+            # porcelain.commit 会提交整个 index。为避免把用户此前暂存的其他文件
+            # 一并提交，只要发现选中范围以外已有暂存内容，就中止并明确提示。
+            before_status = porcelain.status(self.repo_dir)
+            staged = getattr(before_status, "staged", {}) or {}
+            pre_staged_paths = set()
+            for values in staged.values():
+                for path in values or []:
+                    pre_staged_paths.add(_decode_path(path))
+            unrelated_staged = sorted(pre_staged_paths - selected)
+            if unrelated_staged:
+                preview = "\n".join(unrelated_staged[:8])
+                if len(unrelated_staged) > 8:
+                    preview += f"\n……另有 {len(unrelated_staged) - 8} 个文件"
+                messagebox.showwarning(
+                    "发现其他已暂存文件",
+                    "为避免意外提交不属于本次备份的内容，已取消提交。\n\n"
+                    "请先在 Git 客户端处理这些已暂存文件，再重试：\n" + preview,
+                    parent=self,
+                )
+                return
+
+            existing_paths = [
+                path for path in paths
+                if os.path.lexists(os.path.join(self.repo_dir, path.replace("/", os.sep)))
+            ]
+            deleted_paths = [path for path in paths if path not in existing_paths]
+
+            if existing_paths:
+                porcelain.add(self.repo_dir, existing_paths)
+            if deleted_paths:
+                # cached=True 只从 index 移除路径，不再尝试删除已经不存在的工作区文件。
+                porcelain.rm(self.repo_dir, deleted_paths, cached=True)
+
+            after_status = porcelain.status(self.repo_dir)
+            staged_after = getattr(after_status, "staged", {}) or {}
+            staged_paths_after = set()
+            for values in staged_after.values():
+                for path in values or []:
+                    staged_paths_after.add(_decode_path(path))
+
+            unrelated_after = sorted(staged_paths_after - selected)
+            if unrelated_after:
+                raise RuntimeError(
+                    "暂存区出现不属于本次备份的文件，已停止提交以保护其他内容："
+                    + ", ".join(unrelated_after[:8])
+                )
+            if not staged_paths_after:
+                messagebox.showinfo("无需提交", "没有可提交的已暂存变更。", parent=self)
+                self.destroy()
+                return
+
             porcelain.commit(
-                self.repo_dir, 
-                message=msg.encode('utf-8'), 
-                author=f"{APP_NAME} <backup@local>".encode('utf-8')
+                self.repo_dir,
+                message=msg.encode("utf-8"),
+                author=f"{APP_NAME} <backup@local>".encode("utf-8"),
             )
             log_message(f"成功提交 Commit: {msg}", self.enable_log)
             messagebox.showinfo("成功", "工作文档已完成备份提交！", parent=self)
@@ -215,7 +361,7 @@ class HistoryWindow(tk.Toplevel):
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
 
         ttk.Button(btn_frame, text="恢复到此版本", command=self.restore_version).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="删除选中版本", command=self.delete_version).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="删除选中版本（暂不可用）", state="disabled").pack(side="left", padx=5)
         ttk.Button(btn_frame, text="刷新列表", command=self.load_history).pack(side="right", padx=5)
 
         self.load_history()
@@ -254,7 +400,13 @@ class HistoryWindow(tk.Toplevel):
             return
         
         target_sha = selected[0]
-        if messagebox.askyesno("确认恢复", f"是否将工作区还原至版本 [{target_sha[:7]}]？\n\n注意：其它历史版本的提交节点均会被保留。", parent=self):
+        if messagebox.askyesno(
+            "确认恢复",
+            f"是否将当前分支和工作区重置到版本 [{target_sha[:7]}]？\n\n"
+            "警告：未提交的工作区改动会被覆盖；较新的提交可能不再显示在当前分支历史中。\n"
+            "建议先确保重要文件和 Git 历史已有备份。",
+            parent=self,
+        ):
             try:
                 porcelain.reset(self.repo_dir, "hard", target_sha)
                 messagebox.showinfo("成功", f"工作区已成功还原到版本 [{target_sha[:7]}]！", parent=self)
@@ -263,46 +415,13 @@ class HistoryWindow(tk.Toplevel):
                 show_error("还原失败", "恢复指定版本时出错", str(e), self.enable_log)
 
     def delete_version(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("提示", "请先选择要删除的历史版本！", parent=self)
-            return
-
-        target_sha = selected[0]
-        if messagebox.askyesno("确认删除", f"确定要删除历史版本 [{target_sha[:7]}] 吗？", parent=self):
-            try:
-                repo = Repo(self.repo_dir)
-                try:
-                    head_sha = repo.head().decode('utf-8') if isinstance(repo.head(), bytes) else str(repo.head())
-                except KeyError:
-                    messagebox.showwarning("提示", "当前仓库没有任何可删除的提交！", parent=self)
-                    return
-
-                if head_sha == target_sha:
-                    messagebox.showwarning("无法删除", "不能直接删除当前的最新版本 HEAD！", parent=self)
-                    return
-
-                walker = repo.get_walker()
-                commits = [e.commit for e in walker]
-                
-                new_parent = None
-                for c in reversed(commits):
-                    c_sha = c.id.decode('utf-8') if isinstance(c.id, bytes) else str(c.id)
-                    if c_sha == target_sha:
-                        continue
-                    if new_parent:
-                        c.parents = [new_parent.id]
-                    repo.object_store.add_object(c)
-                    new_parent = c
-
-                if new_parent:
-                    repo.refs[b'refs/heads/master'] = new_parent.id
-                    repo.refs[b'HEAD'] = new_parent.id
-
-                messagebox.showinfo("成功", f"已从历史链中移除版本 [{target_sha[:7]}]！", parent=self)
-                self.load_history()
-            except Exception as e:
-                show_error("删除版本失败", "操作提交历史节点时发生错误", str(e), self.enable_log)
+        # 兼容旧调用，但不再改写提交对象/分支引用。旧实现可能损坏现有历史。
+        messagebox.showwarning(
+            "暂不支持删除历史提交",
+            "为保护现有 Git 历史，本版本暂时禁用直接删除单个提交。\n\n"
+            "Git 提交之间存在父子关系，直接改写历史可能使其他提交丢失或变得不可达。",
+            parent=self,
+        )
 
 class BackupApp:
     def __init__(self, root):
@@ -411,21 +530,15 @@ class BackupApp:
             self.pattern_listbox.insert(tk.END, pattern)
 
     def check_and_init_repo(self, target_dir):
+        """复用已有仓库；只有目录还没有 .git 时才初始化，不改写已有历史。"""
         git_dir = os.path.join(target_dir, ".git")
         if os.path.exists(git_dir):
-            confirm = messagebox.askyesno(
-                "导入现有 Git 仓库", 
-                f"目录 [{os.path.basename(target_dir)}] 下已存在 .git 目录。\n\n是否导入并继承已有版本历史？"
-            )
-            if not confirm:
-                return False
             try:
                 Repo(target_dir)
                 return True
             except Exception as e:
-                show_error("打开仓库失败", "无法读取已存在的 Git 版本库", str(e), self.enable_log)
+                show_error("打开仓库失败", "无法读取已存在的 Git 版本库；原有仓库未被修改。", str(e), self.enable_log)
                 return False
-
         try:
             Repo.init(target_dir)
             return True
@@ -472,57 +585,89 @@ class BackupApp:
         self.enable_log = self.var_log.get()
         self.save_app_config()
 
+    def _autostart_command(self):
+        if getattr(sys, "frozen", False):
+            return f'"{os.path.abspath(sys.executable)}"'
+        script_path = os.path.abspath(__file__)
+        python_path = os.path.abspath(sys.executable)
+        # 若存在 pythonw.exe，优先使用它，避免开机时弹出控制台窗口。
+        base_dir = os.path.dirname(python_path)
+        pythonw = os.path.join(base_dir, "pythonw.exe")
+        launcher = pythonw if os.path.isfile(pythonw) else python_path
+        return f'"{launcher}" "{script_path}"'
+
     def check_autostart_status(self):
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-            winreg.QueryValueEx(key, APP_NAME)
-            winreg.CloseKey(key)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                command, _ = winreg.QueryValueEx(key, APP_NAME)
+            expected = self._autostart_command()
+
+            # 旧版可能写入了错误的 .py 路径或指向已移动的 EXE；发现不一致时修正。
+            if command.strip() != expected.strip():
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
+                ) as write_key:
+                    winreg.SetValueEx(write_key, APP_NAME, 0, winreg.REG_SZ, expected)
+                log_message(f"已修正旧的开机启动命令: {expected}", self.enable_log)
             self.var_autostart.set(True)
-        except Exception:
+            log_message(f"检测到开机启动项: {expected}", self.enable_log)
+        except FileNotFoundError:
             self.var_autostart.set(False)
+        except OSError as e:
+            self.var_autostart.set(False)
+            log_message(f"读取/修正开机启动项失败: {e}", self.enable_log)
 
     def toggle_autostart(self):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-            if self.var_autostart.get():
-                exe_path = f'"{sys.executable}"' if getattr(sys, 'frozen', False) else f'"{os.path.abspath(__file__)}"'
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
-            else:
-                try:
-                    winreg.DeleteValue(key, APP_NAME)
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+                if self.var_autostart.get():
+                    command = self._autostart_command()
+                    winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
+                    saved_command, _ = winreg.QueryValueEx(key, APP_NAME)
+                    if saved_command != command:
+                        raise OSError("注册表中的启动命令与写入内容不一致。")
+                    log_message(f"已设置开机自启动: {command}", self.enable_log)
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+                    log_message("已关闭开机自启动", self.enable_log)
         except Exception as e:
-            show_error("设置失败", "无法修改注册表开机自启项", str(e), self.enable_log)
+            self.var_autostart.set(not self.var_autostart.get())
+            show_error("设置失败", "无法修改或验证注册表开机自启项", str(e), self.enable_log)
 
-    def on_file_changed(self):
-        if self.dialog_lock:
+    def on_file_changed(self, candidate_paths=None):
+        if self.dialog_lock or not self.watch_dir:
+            return
+        candidate_paths = set(candidate_paths or [])
+        if not candidate_paths:
             return
 
         def show_dialog():
+            if self.dialog_lock:
+                return
+            self.dialog_lock = True
             try:
-                self.dialog_lock = True
-                untracked = []
-                handler = GitDebounceHandler(self.watch_dir, exclude_patterns=self.exclude_patterns)
-                for root, dirs, files in os.walk(self.watch_dir):
-                    if ".git" in dirs:
-                        dirs.remove(".git")
-                    for file in files:
-                        full_path = os.path.join(root, file)
-                        if not handler.is_excluded(full_path):
-                            rel_path = os.path.relpath(full_path, self.watch_dir).replace("\\", "/")
-                            untracked.append(rel_path)
-
-                if untracked:
-                    dlg = CommitDialog(self.root, self.watch_dir, untracked, self.enable_log)
-                    self.root.wait_window(dlg)
+                changed_files = get_changed_files(
+                    self.watch_dir,
+                    self.enable_log,
+                    self.exclude_patterns,
+                    candidate_paths=candidate_paths,
+                )
+                if not changed_files:
+                    # 文件事件不等于 Git 变更：例如临时文件创建后立即删除。
+                    return
+                dlg = CommitDialog(self.root, self.watch_dir, changed_files, self.enable_log)
+                self.root.wait_window(dlg)
             except Exception as e:
-                show_error("文件变动处理失败", "捕获文件更新事件时发生异常", str(e), self.enable_log)
+                show_error("文件变动处理失败", "检查 Git 文件变更时发生异常", str(e), self.enable_log)
             finally:
                 self.dialog_lock = False
 
+        # 所有 Tkinter UI 操作都安排到主线程执行。
         self.root.after(0, show_dialog)
 
     def toggle_monitoring(self):
@@ -598,10 +743,12 @@ class BackupApp:
         self.root.after(0, self.root.destroy)
 
 def ensure_single_instance(root):
+    """尝试唤醒已运行实例；固定端口不可用且无人应答时，不误退出程序。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(('127.0.0.1', SINGLE_INSTANCE_PORT))
-        sock.listen(1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        sock.listen(5)
 
         def listen_wake_up():
             while True:
@@ -614,17 +761,28 @@ def ensure_single_instance(root):
 
         threading.Thread(target=listen_wake_up, daemon=True).start()
         return True
-    except socket.error:
+    except OSError as bind_error:
+        sock.close()
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
+            client.settimeout(0.5)
+            client.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
             client.close()
-        except Exception:
-            pass
-        sys.exit(0)
+            # 确认端口上已有实例响应，才认为程序已经运行。
+            return False
+        except OSError:
+            client.close()
+            # 端口可能被其他软件占用；此时继续运行，不能直接退出。
+            try:
+                log_message(f"单实例端口 {SINGLE_INSTANCE_PORT} 被占用，但没有 OfficeGitSync 实例响应: {bind_error}")
+            except Exception:
+                pass
+            return True
 
 if __name__ == "__main__":
     root = tk.Tk()
-    ensure_single_instance(root)
+    if not ensure_single_instance(root):
+        root.destroy()
+        sys.exit(0)
     app = BackupApp(root)
     root.mainloop()
