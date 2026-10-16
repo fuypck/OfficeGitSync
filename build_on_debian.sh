@@ -1,10 +1,29 @@
-#!/bin/bash
-echo "正在准备 Windows 打包环境..."
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# 下载 Windows 版 Python 便携包/安装包，或直接用 Wine 运行 PyInstaller
-wine python -m pip install psutil pystray Pillow pyinstaller
+cd "$(dirname "$0")"
 
-echo "开始编译 Windows 可执行文件..."
-wine pyinstaller --noconfirm --onedir --windowed --name "OfficeGitSync" git_sync.py
+if ! command -v wine >/dev/null 2>&1; then
+    echo "错误：未找到 Wine。请在 Debian/Linux 上安装并配置 Wine。" >&2
+    exit 1
+fi
 
-echo "打包完成！产物位于 dist/OfficeGitSync/ 目录中"
+if ! wine python --version; then
+    echo "错误：Wine 中未找到可用的 Windows Python。请先安装 Windows 版 Python，并确认 'wine python' 可运行。" >&2
+    exit 1
+fi
+
+echo "正在安装 Windows Python 依赖..."
+wine python -m pip install --upgrade pip
+wine python -m pip install dulwich watchdog pystray Pillow pyinstaller
+
+echo "开始打包 Windows 程序..."
+wine pyinstaller --noconfirm --clean --onedir --windowed --name "OfficeGitSync" git_sync.py
+
+if [[ ! -f "dist/OfficeGitSync/OfficeGitSync.exe" ]]; then
+    echo "错误：未找到预期产物 dist/OfficeGitSync/OfficeGitSync.exe。请检查上面的打包日志。" >&2
+    exit 1
+fi
+
+echo "打包完成：dist/OfficeGitSync/OfficeGitSync.exe"
+echo "注意：请在 Windows 上实际启动并测试后再发布。"
