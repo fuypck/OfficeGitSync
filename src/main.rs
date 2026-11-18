@@ -48,7 +48,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("OfficeGitSync — Rust preview");
+            ui.heading(format!("OfficeGitSync {} — Rust preview", env!("OFFICEGITSYNC_VERSION")));
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.advanced, false, "Document backup");
                 ui.selectable_value(&mut self.advanced, true, "Advanced Git");
