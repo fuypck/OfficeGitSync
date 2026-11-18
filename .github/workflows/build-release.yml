@@ -21,8 +21,32 @@ jobs:
         shell: pwsh
         run: |
           $tag = $env:GITHUB_REF_NAME
-          Copy-Item target/release/OfficeGitSync.exe "OfficeGitSync_$tag.exe"
+          $asset = if ($tag -eq 'v0.2.0') {
+            "OfficeGitSync-$tag-windows-x64.exe"
+          } else {
+            "OfficeGitSync_$tag.exe"
+          }
+          Copy-Item target/release/OfficeGitSync.exe $asset
+      - name: Publish the Rust rewrite preview
+        if: github.ref_name == 'v0.2.0'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OfficeGitSync v0.2.0 Preview
+          prerelease: true
+          files: OfficeGitSync-v0.2.0-windows-x64.exe
+          fail_on_unmatched_files: true
+          body: |
+            ### 中文
+            OfficeGitSync Rust 重构预览版。支持选中文件后确认备份、浏览历史和导出独立副本，以及托盘、单实例和主题设置。本地备份使用内置 libgit2，无需安装 Git。
+
+            **验证情况**：Linux 本地测试和 Windows 原生 GitHub Actions 构建与测试已通过。Wine 中验证了中文界面、托盘唤醒、无 Git 提交和安全导出；递归文件监听在 Wine 中会超时。Windows 实机覆盖仍有限。附件为 CI 生成的 Windows x64 EXE。
+
+            ### English
+            Rust rewrite preview with confirmed selected-file backups, history and safe export, tray controls, single-instance activation, and themes. Local backups use embedded libgit2.
+
+            **Validation:** Linux tests and native Windows CI build and tests passed. Wine smoke tests covered Chinese UI, tray activation, commits without Git, and safe export. Recursive file watching timed out in Wine, and physical Windows coverage remains limited. The attached Windows x64 EXE was built by CI.
       - uses: softprops/action-gh-release@v2
+        if: github.ref_name != 'v0.2.0'
         with:
           files: OfficeGitSync_*.exe
           overwrite_files: true

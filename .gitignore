@@ -1,5 +1,6 @@
 # Rust build output and local release packages
 /target/
+/releases/
 /OfficeGitSync_*.exe
 /build/
 /dist/
