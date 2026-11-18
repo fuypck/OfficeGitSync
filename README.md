@@ -1,136 +1,82 @@
-# OfficeGitSync 📄⚡
+# OfficeGitSync
 
-**OfficeGitSync v0.1.5** 是一款面向 Windows 的轻量级、本地 Git 文档版本备份工具。它使用 Watchdog 监听文件系统变化，通过 Dulwich 管理 Git 版本历史，主要面向 WPS、Microsoft Office、设计文件及其他日常工作文件。
+OfficeGitSync Rust **0.2.0 预览版**是一个面向工作文档的本地版本备份工具。它监听指定目录、提示用户确认备份，并把选中的文件变更记录到 Git。应用使用简体中文桌面界面，支持 Windows 和 Linux。
 
-> **开发状态：v0.1.5（待实机验证）**。目前功能已在源码中实现，但尚未完成真实 Windows 环境下的系统测试，尤其是自动备份、开机自启动、历史恢复与删除。请勿将本程序作为重要文件的唯一备份手段。
+[English summary](#english-summary) · [产品需求与设计原则](prompt.txt) · [Rust 迁移记录](RUST_REWRITE.md)
 
-## 主要功能
+## 功能
 
-- **实时监听与防抖**：监听指定目录及子目录的文件事件，默认将连续事件合并到约 3 秒后处理。
-- **精确识别变更**：结合本轮文件事件与 Git 状态，仅提示相应的实际变更路径，减少无关文件的重复弹窗。
-- **自定义排除规则**：默认过滤 Office/WPS 锁文件、`*.tmp`、`*.bak`、FreeFileSync 临时文件、`*.crdownload` 及 `.git` 内部文件；可在界面中添加或删除规则。
-- **确认后提交备份**：弹窗列出待提交文件，可填写提交说明及可选版本标签；只有确认后才执行 Git 提交，并检查是否存在不属于本次范围的已暂存文件。
-- **手动创建备份/标签**：不依赖自动监听事件，也可以主动检查当前工作目录的 Git 变更并创建提交。
-- **历史版本管理**：查看提交时间、说明、SHA 与标签，选择历史版本进行恢复，为历史提交添加标签，或删除选中的历史版本。
-- **独立时间线引用**：通过 `officegitsync-timeline` 分支尝试保留恢复前后的历史版本，以便在旧版本与较新版本之间切换。
-- **已有 Git 仓库导入**：选定目录存在 `.git` 时，支持确认后沿用现有仓库；否则可初始化新仓库。
-- **系统托盘与启动选项**：支持关闭主窗口后驻留托盘、后台静默启动，以及通过当前用户注册表配置 Windows 开机自启动；启动时会检查并尝试修正过期的启动路径。
-- **单实例机制与可选日志**：尝试阻止重复运行并唤醒已有窗口；可选择在程序目录输出 `officegitsync.log`。
+- **文档备份**将递归文件事件合并后列出相关 Git 变更，也可手动扫描。勾选文件后确认提交，说明预填当前本地时间，可直接编辑。
+- **历史版本**显示当前分支及旧版时间线的提交、说明、时间和标签。选中版本后可导出到独立子目录，或创建新标签。
+- **设置**管理主题、监听防抖、排除规则、可选日志、系统托盘、静默启动与登录启动。支持导入旧版 `.officegitsync.json`。
+- **Git 高级**提供文本差异、备份标签、添加远程仓库和 Fetch。
 
-## 快速使用
+本地初始化、扫描、提交、历史浏览和导出由内置 libgit2 执行，系统无需安装 `git` 命令。Git 仓库保存在所选工作目录中。配置、实例锁和启用后的日志保存在用户配置目录。
 
-1. 从 [Releases](https://github.com/fuypck/OfficeGitSync/releases) 下载已发布的 Windows 构建；如果没有可用版本，可检查 [Actions](https://github.com/fuypck/OfficeGitSync/actions) 是否提供构建产物。
-2. 运行 `OfficeGitSync.exe`，选择需要监控的工作目录。若已有 Git 仓库，按提示选择是否导入。
-3. 点击 **开启无感自动备份**。发生文件变化后，程序会检查 Git 状态并弹出备份确认窗口；点击 **提交备份** 才会创建版本。
-4. 使用 **手动创建备份/标签** 主动记录版本，或打开 **历史版本管理** 浏览、恢复、标记及删除历史提交。
-5. 按需开启 **开机自启动**、**启动时后台静默运行** 和 **输出 Log 日志**。
+## 平台支持
 
-**说明：**“无感自动备份”指后台监听与变更检测，并非完全无人值守的自动提交；当前设计仍要求用户确认提交。
+| 项目 | Windows | Linux |
+| --- | --- | --- |
+| 工作和导出目录 | 手动输入或原生文件夹选择器 | 手动输入 |
+| 简体中文字体 | 优先使用微软雅黑常规体，并校验中文覆盖 | 通过 Fontconfig 查找简体中文字体 |
+| 后台与托盘 | Windows 系统托盘 | 需要支持 StatusNotifierItem 的桌面会话 |
+| 当前用户登录启动 | 注册表 Run 项 | XDG Autostart |
+| 配置目录 | `%APPDATA%\OfficeGitSync` | `$XDG_CONFIG_HOME/OfficeGitSync`，默认 `~/.config/OfficeGitSync` |
 
-## 历史版本与数据安全
+Debian/Kali 可用 `sudo apt install fontconfig fonts-noto-cjk` 提供中文字体。托盘不可用时，关闭窗口会退出。静默启动需要已保存的有效工作目录和启用的监听设置。
 
-v0.1.5 的历史管理不再是只能查看和恢复：源码中已经提供 **删除选中版本** 功能，并通过重建后续提交链实现。此操作会改变部分提交 SHA，也可能影响已有分支、标签或其他 Git 工具的引用关系；**在充分测试前，不建议对重要仓库使用删除功能**。
+## 使用
 
-- **恢复到此版本** 使用 Git 硬重置（`reset --hard`），会覆盖受 Git 管理文件中尚未提交的工作区修改，并改变当前分支指向。操作前请独立复制重要文件。
-- **删除选中版本** 会改写 Git 历史。独立时间线引用旨在保留版本可访问性，但不构成在所有分叉、标签和异常情况下的完整性保证。
-- Git 历史保存在所监控目录的 `.git` 中；**不会自动上传到 GitHub 或云盘**。请勿随意删除或覆盖 `.git`。
-- 建议先用专门创建的测试目录验证恢复、删除和启动行为，确认符合预期后再考虑用于真实文档。
+1. 启动 `OfficeGitSync.exe`（Windows）或 `OfficeGitSync`（Linux）。在「文档备份」输入一个已有目录。已有 Git 仓库可直接扫描，新目录可点击「初始化 Git 仓库」。
+2. 启用「监听工作目录」或点击「扫描变更」。勾选要备份的文件，编辑提交说明，然后点击「确认备份」。
+3. 如需查看旧内容，打开「历史版本」，选中提交，输入工作区外已存在的目标目录，再确认导出。应用会在目标目录下创建新子目录，并记住上次成功使用的目标目录。
+4. 在「设置」保存监听、工作目录等偏好，也可编辑内置和自定义排除规则。主题选项切换后立即应用并保存。可选日志用于记录备份和监听事件，默认关闭。
 
-## 从源码运行（Windows）
+再次启动同一用户的应用时，会唤醒正在运行的窗口。
 
-建议使用 Python 3.10 或更新的兼容版本：
+## Git 安全机制
 
-```powershell
-git clone https://github.com/fuypck/OfficeGitSync.git
-cd OfficeGitSync
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python git_sync.py
+- 监听只提示待确认的变更。提交前会核对扫描时的分支和提交、选中文件、暂存区和索引锁。遇到已有暂存内容、合并、变基或分离 HEAD 等情况，备份会停止并提示。
+- 应用先在独立索引中按字面路径暂存，再核对将提交的变更。需要 Git LFS 等专用内容转换的文件会提示使用支持该转换的客户端。
+- 版本导出保留原工作区、Git 索引和分支指针。导出拒绝符号链接、子模块和不安全的路径。标签保留已有同名引用。
+- 备份建立在本地 Git 提交上。远程 Fetch 是显式操作，目前没有 Push、Pull 或自动云同步。
+
+## Rust 构建
+
+使用 Rust stable 工具链。构建前确认工作树位于 `rust-rewrite` 分支。
+
+```sh
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 ```
 
-如果 PowerShell 禁止激活虚拟环境，可直接调用 `.\.venv\Scripts\python.exe` 运行脚本。
+本机构建产物位于 Windows 的 `target/release/OfficeGitSync.exe` 或 Linux 的 `target/release/OfficeGitSync`。Windows 本机构建使用支持 Rust MSVC 工具链的 Visual Studio C++ 生成工具及 Windows SDK。Linux 需要 C 编译工具链、`pkg-config` 和 OpenSSL 开发文件。依赖已缓存时可为 Cargo 构建、检查、测试和 Clippy 命令加 `--offline`。
 
-## Windows 打包
+在 Linux 上使用 MinGW-w64 交叉构建 Windows x64：
 
-```powershell
-python -m pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm --clean --onedir --windowed --name OfficeGitSync git_sync.py
+```sh
+rustup target add x86_64-pc-windows-gnu
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+  cargo build --locked --release --target x86_64-pc-windows-gnu
 ```
 
-产物位于 `dist/OfficeGitSync/`。请分发整个目录，而不只是单独的 EXE 文件。
+交叉构建产物为 `target/x86_64-pc-windows-gnu/release/OfficeGitSync.exe`。常规构建使用 [Cargo.toml](Cargo.toml) 中的版本。发布工作流构建 `v*` 标签时会把标签版本传给程序。预览构建可在 [GitHub Actions](https://github.com/fuypck/OfficeGitSync/actions) 中查看，已发布版本以 [GitHub Releases](https://github.com/fuypck/OfficeGitSync/releases) 为准。
 
-## Debian/Linux + Wine 辅助打包
+## 项目状态
 
-仓库包含 `build_on_debian.sh`，需要预先安装 Wine，并确保 Wine 环境内已有可用的 **Windows Python**：
+`rust-rewrite` 是 Rust 预览分支。仍待完善的功能包括 Linux 原生目录选择、复杂远程认证、Office 二进制文档的语义差异和 Linux 安装包。历史删除及原地恢复暂缓。Windows 文件监听的递归测试在 Wine 中会超时，Windows 实机结果需单独验证。
 
-```bash
-wine python --version
-bash build_on_debian.sh
-```
+Rust 源码位于 `src/`，程序图标及其源文件位于 `assets/`，依赖锁定文件为 `Cargo.lock`。旧版源码和打包脚本作为迁移参考保留，Rust 构建不依赖它们。
 
-PyInstaller 不能直接将 Linux Python 程序交叉编译为 Windows 程序。此脚本依赖 Wine 内的 Windows Python；**ARM64 Android/NetHunter 环境未验证兼容性**。
+作者 Ed Clack · [GitHub 项目](https://github.com/fuypck/OfficeGitSync)
 
-## 自动构建与依赖
+## English summary
 
-如果已配置 GitHub Actions 工作流，可以在 [Actions](https://github.com/fuypck/OfficeGitSync/actions) 查看运行结果；只有工作流上传了 artifact 或发布了 Release 才会出现可下载文件。构建成功也不代表 Windows 实机功能已通过测试。
+OfficeGitSync is a Simplified Chinese desktop app for local document version backups on Windows and Linux. The Rust preview uses libgit2 for local repository initialization, selected-file commits, history browsing, and version export.
 
-运行时依赖见 [requirements.txt](requirements.txt)：`dulwich`、`watchdog`、`pystray` 和 `Pillow`；打包另需 `PyInstaller`。
+Choose a working directory, enable monitoring or scan manually, and confirm the files you want to commit. To recover a version, export it into a new subdirectory outside the working tree. Windows offers native folder pickers. On Linux, Chinese text uses a Fontconfig-discovered font, and the tray requires a StatusNotifierItem host.
 
----
-
-## English
-
-**OfficeGitSync v0.1.5** is a lightweight, Windows-oriented local Git version-backup utility for Office documents and other working files. It uses Watchdog for filesystem monitoring and Dulwich for Git operations.
-
-> **Status: Not yet validated on a real Windows system.** The features described below are implemented in the source code but still require practical testing. Do not rely on this application as your only backup.
-
-### Features
-
-- Debounced recursive filesystem monitoring (3-second default) and Git-status-based filtering of event-related changes.
-- Configurable exclusion patterns for Office/WPS lock files, temporary files, FreeFileSync files, and Git internals.
-- Confirmation dialogs for commits, optional commit tags, and checks against unrelated staged files.
-- Manual backups, history browsing, restoring previous versions, adding tags, and deleting selected history entries.
-- A dedicated `officegitsync-timeline` ref intended to preserve access to newer versions after restoring older ones.
-- Import of existing Git repositories or initialization of new ones.
-- System tray, optional silent startup, Windows user-level autostart, single-instance handling, and optional logs.
-
-### Getting started
-
-Download an available build from [Releases](https://github.com/fuypck/OfficeGitSync/releases) or check [Actions](https://github.com/fuypck/OfficeGitSync/actions) for build artifacts. Run `OfficeGitSync.exe`, select a working directory, and start monitoring. **Commits require user confirmation**; monitoring does not silently create commits.
-
-### Important safety notes
-
-- **Restore uses `reset --hard`** and can overwrite uncommitted tracked-file changes and move the current branch pointer.
-- **Deleting a history entry rewrites the commit chain** and can change commit IDs or affect other references. This feature has not been validated for all Git history shapes; use a disposable test repository first.
-- Git history remains local in `.git`; it is not automatically uploaded to GitHub or any cloud service.
-- Keep independent backups of important documents.
-
-### Run from source (Windows)
-
-```powershell
-git clone https://github.com/fuypck/OfficeGitSync.git
-cd OfficeGitSync
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python git_sync.py
-```
-
-### Build on Windows
-
-```powershell
-python -m pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm --clean --onedir --windowed --name OfficeGitSync git_sync.py
-```
-
-Distribute the complete `dist/OfficeGitSync/` directory.
-
-### Build with Wine on Debian/Linux
-
-`build_on_debian.sh` requires Wine and Windows Python installed inside Wine. It is not a general cross-compilation solution and has not been validated on ARM64 Android/NetHunter.
-
-### CI and dependencies
-
-Check the repository's Actions page for available builds. Successful CI builds are not a substitute for Windows runtime tests. Runtime dependencies are listed in [requirements.txt](requirements.txt); packaging additionally requires PyInstaller.
+Build with Rust stable and `cargo build --locked --release`. See [Rust build instructions](#rust-构建) for the Windows x64 cross-build. The preview supports text diffs and explicit Fetch. Push, Pull, in-place restoration, and history deletion are outside the current implementation.

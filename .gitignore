@@ -1,8 +1,31 @@
-__pycache__/
-*.pyc
-build/
-dist/
+# Rust build output and local release packages
+/target/
+/OfficeGitSync_*.exe
+/build/
+/dist/
 *.spec
-config.json
-prompt.txt
+
+# Python caches and local virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
 venv/
+
+# Test, editor and runtime leftovers
+.test-tmp/
+.tmp/
+*.tmp
+*.swp
+*.log
+
+# Per-user configuration
+/config.json
+/settings.json
+/.officegitsync.json
+/.env
+/.env.local
+/instance.lock
+/show.request
