@@ -1,22 +1,9 @@
-# OfficeGitSync Rust rewrite
+# Rust 测试版功能说明
 
-Development branch: `rust-rewrite`. The original Python implementation remains on `main`.
+此分支为 Windows 实机测试版本，主分支 Python 版本不变。
 
-## Current milestone
+已实现：简体中文 GUI、Windows GUI 子系统（无控制台窗口）、系统中文字体加载、仓库状态、手动选择文件提交、文本差异、只读提交历史、初始化仓库、添加 Remote、Fetch、自动轮询检测并人工确认提交、按软件分组的可编辑排除规则及生效列表、设置持久化。
 
-- Native Rust/egui GUI scaffold
-- Open an existing local Git repository and show Git status
-- Grouped temporary-file exclusions for Office/WPS, LibreOffice, Vim, Emacs, FreeFileSync, browsers
-- Editable custom glob patterns in the prototype interface
-- Windows CI on every push to this branch
+注意：自动检测当前使用轮询机制；Office 二进制文档暂未实现语义差异。远程 SSH/HTTPS 凭据及 Push/Pull、分支/标签/历史恢复、托盘与开机启动仍待实现。请勿作为唯一备份工具。提交操作会修改仓库索引，请先用测试仓库验证。
 
-**Not yet implemented:** file watching, commit confirmation, version history restore, remote fetch/pull/push, credential management, persisted settings, Office-aware diff, and tag-based release builds. Do not use this preview as a backup tool.
-
-## Local development
-
-```sh
-cargo run
-cargo test
-```
-
-The old Python release workflow is intentionally left unchanged on the `main` branch. Once Rust CI passes and release metadata integration is implemented, replace the release workflow on this branch. A tag must point to the Rust commit to publish the Rust executable.
+版本号来自 Git 标签；正式发布由 build-release.yml 在推送 v* 标签时构建。
