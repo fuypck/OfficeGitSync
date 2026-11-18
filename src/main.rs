@@ -55,7 +55,6 @@ struct App {
     notice: String,
     advanced: bool,
     tab: usize,
-    filter_editor: String,
     custom_editor: String,
     last_check: Instant,
     pending_backup: bool,
@@ -65,10 +64,9 @@ impl Default for App {
     fn default() -> Self {
         let settings = load_settings();
         let custom_editor = settings.filters.custom.join("\n");
-        let filter_editor = String::new();
         let mut app = Self { settings, changes: Vec::new(), history: Vec::new(),
             message: "文档备份".into(), diff: String::new(), selected_path: String::new(),
-            notice: String::new(), advanced: false, tab: 0, filter_editor, custom_editor,
+            notice: String::new(), advanced: false, tab: 0, custom_editor,
             last_check: Instant::now(), pending_backup: false, previous_snapshot: Vec::new() };
         app.refresh();
         app
@@ -288,7 +286,7 @@ impl eframe::App for App {
                             ui.label(format!("{} 条规则", preset.patterns.len()));
                         });
                         if preset.enabled {
-                            ui.indent(&preset.name, |ui| {
+                            ui.indent(preset.name.as_str(), |ui| {
                                 for pattern in &mut preset.patterns { ui.text_edit_singleline(pattern); }
                             });
                         }
