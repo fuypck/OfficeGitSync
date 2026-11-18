@@ -74,11 +74,21 @@ impl Default for App {
 }
 impl App {
     fn repo(&self) -> Result<Repository, String> { Repository::open(&self.settings.repo_path).map_err(|e| e.to_string()) }
+    fn snapshot(&self, items: &[Change]) -> Vec<String> {
+        items.iter().map(|c| {
+            let full = PathBuf::from(&self.settings.repo_path).join(&c.path);
+            let stamp = fs::metadata(full).ok().map(|m| {
+                let time = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                format!("{}:{:?}", m.len(), time)
+            }).unwrap_or_else(|| "deleted".into());
+            format!("{}:{}:{}", c.path, c.status, stamp)
+        }).collect()
+    }
     fn refresh(&mut self) {
         match self.read_status() {
             Ok(changes) => {
                 self.changes = changes;
-                self.previous_snapshot = self.changes.iter().map(|c| format!("{}:{}", c.path, c.status)).collect();
+                self.previous_snapshot = self.snapshot(&self.changes);
                 self.notice = format!("已刷新，共 {} 项变更", self.changes.len());
             }
             Err(e) => self.notice = format!("仓库读取失败：{e}"),
@@ -193,7 +203,7 @@ impl eframe::App for App {
         if self.settings.auto_check && self.last_check.elapsed() >= Duration::from_secs(self.settings.interval_secs.max(2)) {
             self.last_check = Instant::now();
             if let Ok(items) = self.read_status() {
-                let snapshot: Vec<String> = items.iter().map(|c| format!("{}:{}", c.path, c.status)).collect();
+                let snapshot = self.snapshot(&items);
                 if snapshot != self.previous_snapshot {
                     self.changes = items;
                     self.previous_snapshot = snapshot;
