@@ -28,6 +28,8 @@ impl eframe::App for App {
             return;
         }
         self.update_monitor(ctx);
+        #[cfg(target_os = "linux")]
+        self.update_picker();
 
         egui::TopBottomPanel::top("navigation").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -73,8 +75,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
             Page::Backup => self.show_backup(ui, frame),
             Page::History => self.show_history(ui, frame),
-            Page::Settings => self.show_settings(ui, ctx),
-            Page::Advanced => self.show_advanced(ui),
+            Page::Settings => self.show_settings(ui, ctx, frame),
+            Page::Advanced => self.show_advanced(ui, ctx, frame),
         });
     }
 }
@@ -201,7 +203,7 @@ impl App {
         }
     }
 
-    fn show_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, _frame: &eframe::Frame) {
         ui.horizontal(|ui| {
             for (section, label) in [
                 (SettingsSection::General, "常规"),
@@ -218,12 +220,36 @@ impl App {
             SettingsSection::Import => {
                 ui.heading("导入 Python 版配置");
                 ui.label("选择旧版 .officegitsync.json 文件。导入会更新当前工作目录、监听选项和排除规则。");
+                #[cfg(target_os = "linux")]
+                ui.weak("若旧配置未显示，可在选择器中按 Ctrl+H 显示隐藏文件。");
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.python_config_path);
+                    if ui
+                        .text_edit_singleline(&mut self.python_config_path)
+                        .changed()
+                    {
+                        self.python_import_error = None;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if ui.button("浏览…").clicked() {
+                        let result = crate::windows_ui::hwnd(_frame).and_then(|owner| {
+                            crate::windows_ui::pick_python_config(owner).map_err(|e| e.to_string())
+                        });
+                        self.apply_python_picker_result(result);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("浏览…"))
+                        .clicked()
+                    {
+                        self.open_picker(ctx, PickerPurpose::PythonConfig);
+                    }
                     if ui.button("导入并保存").clicked() {
                         self.import_python_settings();
                     }
                 });
+                if let Some(error) = &self.python_import_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
             }
         }
     }
@@ -294,9 +320,15 @@ impl App {
                 self.quit(ctx);
             }
         });
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.hyperlink_to("GitHub", "https://github.com/fuypck/OfficeGitSync");
+            ui.hyperlink_to("蓝奏云", "https://wwbvu.lanzoum.com/b00egzj8wb");
+            ui.label("蓝奏云访问密码  1jjn");
+        });
     }
 
-    fn show_advanced(&mut self, ui: &mut egui::Ui) {
+    fn show_advanced(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, _frame: &eframe::Frame) {
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.advanced_section,
@@ -350,21 +382,63 @@ impl App {
             AdvancedSection::Remote => {
                 ui.heading("远程仓库");
                 ui.label("Remote 名称");
-                ui.text_edit_singleline(&mut self.settings.remote_name);
-                ui.label("Git URL / 本地目录 / 局域网共享路径");
-                ui.text_edit_singleline(&mut self.settings.remote_url);
+                if ui
+                    .text_edit_singleline(&mut self.settings.remote_name)
+                    .changed()
+                {
+                    self.remote_init = None;
+                }
+                ui.label("Git URL / SSH 地址 / 本地或网络目录");
                 ui.horizontal(|ui| {
-                    if ui.button("添加 Remote").clicked() {
-                        self.remote_action("add");
+                    if ui
+                        .text_edit_singleline(&mut self.settings.remote_url)
+                        .changed()
+                    {
+                        self.remote_init = None;
+                    }
+                    #[cfg(target_os = "windows")]
+                    if ui.button("浏览…").clicked() {
+                        let result = crate::windows_ui::hwnd(_frame).and_then(|owner| {
+                            crate::windows_ui::pick_folder(owner, "选择远程仓库目录")
+                                .map_err(|e| e.to_string())
+                        });
+                        self.apply_remote_picker_result(result);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("浏览…"))
+                        .clicked()
+                    {
+                        self.open_picker(_ctx, PickerPurpose::RemoteFolder);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("检查并保存 Remote").clicked() {
+                        self.save_remote();
                     }
                     if ui.button("Fetch").clicked() {
-                        self.remote_action("fetch");
+                        self.fetch_remote();
+                    }
+                    if ui.button("推送当前分支到裸仓库").clicked() {
+                        self.push_local_remote();
                     }
                     if ui.button("保存配置").clicked() {
                         self.save();
                     }
                 });
-                ui.weak("复杂 HTTPS / SSH 认证与 Push/Pull 尚待完善。");
+                if let Some(path) = &self.remote_init {
+                    ui.separator();
+                    ui.label(format!("将在此空目录创建裸仓库：{}", path.display()));
+                    ui.horizontal(|ui| {
+                        if ui.button("确认初始化并保存").clicked() {
+                            self.initialize_remote();
+                        }
+                        if ui.button("取消").clicked() {
+                            self.remote_init = None;
+                        }
+                    });
+                }
+                ui.weak("本地或网络共享内的非裸仓库可 Fetch；写入仅用于裸仓库。");
             }
         }
     }

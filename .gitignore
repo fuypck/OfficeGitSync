@@ -30,3 +30,6 @@ venv/
 /.env.local
 /instance.lock
 /show.request
+
+# Local Codex session backups
+/.codex-history/

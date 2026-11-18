@@ -11,8 +11,8 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
-                FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-                SIGDN_FILESYSPATH,
+                Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST,
+                FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
             },
             WindowsAndMessaging::{
                 IsIconic, IsWindowVisible, KillTimer, LoadIconW, MessageBoxIndirectW, PostMessageW,
@@ -101,6 +101,14 @@ unsafe extern "system" fn paint_hidden_window(hwnd: HWND, _: u32, _: usize, _: u
 }
 
 pub fn pick_folder(owner: HWND, title: &str) -> windows::core::Result<Option<PathBuf>> {
+    pick_path(owner, title, true)
+}
+
+pub fn pick_python_config(owner: HWND) -> windows::core::Result<Option<PathBuf>> {
+    pick_path(owner, "选择旧版 Python 配置", false)
+}
+
+fn pick_path(owner: HWND, title: &str, folder: bool) -> windows::core::Result<Option<PathBuf>> {
     struct ComApartment;
     impl Drop for ComApartment {
         fn drop(&mut self) {
@@ -115,7 +123,16 @@ pub fn pick_folder(owner: HWND, title: &str) -> windows::core::Result<Option<Pat
         let _apartment = ComApartment;
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+        let options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM;
+        if folder {
+            dialog.SetOptions(options | FOS_PICKFOLDERS)?;
+        } else {
+            dialog.SetOptions(options | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)?;
+            dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("旧版 Python 配置 (*.json)"),
+                pszSpec: w!("*.json"),
+            }])?;
+        }
         let title: Vec<_> = title.encode_utf16().chain(Some(0)).collect();
         dialog.SetTitle(PCWSTR(title.as_ptr()))?;
         match dialog.Show(owner) {

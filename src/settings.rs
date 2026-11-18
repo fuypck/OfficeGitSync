@@ -163,22 +163,22 @@ impl Default for PythonSettings {
 }
 
 pub fn import_python(path: &Path, current: &Settings) -> Result<Settings, String> {
-    let data = fs::read(path).map_err(|e| e.to_string())?;
-    // Check for a recognized key before deserializing defaults.
-    let value: serde_json::Value = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
-    if ![
-        "watch_dir",
-        "exclude_patterns",
-        "debounce_seconds",
-        "enable_log",
-        "silent_start",
-    ]
-    .iter()
-    .any(|key| value.get(key).is_some())
-    {
-        return Err("请选择 Python 版的 .officegitsync.json 配置文件".into());
+    if path.as_os_str().is_empty() {
+        return Err("请选择或输入 .officegitsync.json 文件路径".into());
     }
-    let old: PythonSettings = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let data = fs::read(path).map_err(|e| format!("无法读取 {}：{e}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&data).map_err(|e| format!("JSON 格式错误：{e}"))?;
+    let object = value.as_object().ok_or("旧版配置应为 JSON 对象")?;
+    // Distinguish the Python schema from Rust settings with similarly named preferences.
+    if !["watch_dir", "exclude_patterns", "debounce_seconds"]
+        .iter()
+        .any(|key| object.contains_key(*key))
+    {
+        return Err("缺少旧版配置字段 watch_dir、exclude_patterns 或 debounce_seconds".into());
+    }
+    let old: PythonSettings =
+        serde_json::from_slice(&data).map_err(|e| format!("旧版配置字段无效：{e}"))?;
     let mut result = current.clone();
     result.repo_path = old.watch_dir;
     result.interval_secs = old.debounce_seconds.clamp(1, 3600);
@@ -272,5 +272,31 @@ mod tests {
             .compile()
             .unwrap()
             .is_excluded("docs/current.tmp"));
+    }
+
+    #[test]
+    fn python_import_reports_json_and_schema_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".officegitsync.json");
+        let current = Settings::default();
+        assert!(import_python(&path, &current)
+            .err()
+            .unwrap()
+            .contains("无法读取"));
+        for (data, reason) in [
+            ("{", "JSON 格式错误"),
+            ("[]", "JSON 对象"),
+            (
+                r#"{"repo_path":"rust","enable_log":true}"#,
+                "缺少旧版配置字段",
+            ),
+            (r#"{"watch_dir":5}"#, "配置字段无效"),
+        ] {
+            fs::write(&path, data).unwrap();
+            assert!(import_python(&path, &current)
+                .err()
+                .unwrap()
+                .contains(reason));
+        }
     }
 }

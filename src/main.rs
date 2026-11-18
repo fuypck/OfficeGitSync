@@ -9,7 +9,10 @@ mod fonts;
 mod history;
 mod icon;
 mod instance;
+#[cfg(target_os = "linux")]
+mod linux_ui;
 mod monitor;
+mod remote;
 mod settings;
 #[cfg(target_os = "windows")]
 mod windows_ui;

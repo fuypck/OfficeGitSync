@@ -1,6 +1,6 @@
 [package]
 name = "officegitsync"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 build = "build.rs"
 
@@ -17,6 +17,7 @@ globset = "0.4"
 notify = "8.2.2"
 png = "0.18"
 tempfile = "3"
+url = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [build-dependencies]
@@ -27,7 +28,7 @@ ab_glyph = "0.2"
 tray-icon = { version = "0.26.1", default-features = false }
 winreg = "0.56.0"
 raw-window-handle = "0.6"
-windows = { version = "0.58", features = ["Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.7", features = ["blocking"] }

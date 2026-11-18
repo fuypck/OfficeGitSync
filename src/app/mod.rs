@@ -1,12 +1,22 @@
 mod ui;
 
-use crate::{autostart, backup, desktop, filters, history, instance, monitor, settings};
+use crate::{autostart, backup, desktop, filters, history, instance, monitor, remote, settings};
 use backup::Change;
 use eframe::egui;
 use git2::{DiffOptions, Repository, RepositoryInitOptions};
 use settings::Settings;
 use std::{path::Path, time::Duration};
 use ui::{AdvancedSection, Page, SettingsSection};
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type PickerResult = Result<Option<std::path::PathBuf>, String>;
+
+#[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
+enum PickerPurpose {
+    PythonConfig,
+    RemoteFolder,
+}
 
 pub(crate) struct App {
     settings: Settings,
@@ -29,6 +39,10 @@ pub(crate) struct App {
     filter_editor: filters::FilterSettings,
     custom_editor: String,
     python_config_path: String,
+    python_import_error: Option<String>,
+    #[cfg(target_os = "linux")]
+    picker: Option<(PickerPurpose, std::sync::mpsc::Receiver<PickerResult>)>,
+    remote_init: Option<std::path::PathBuf>,
     monitor: Option<monitor::Monitor>,
     pending_backup: bool,
     desktop: Option<desktop::Desktop>,
@@ -68,6 +82,10 @@ impl App {
             filter_editor,
             custom_editor,
             python_config_path: String::new(),
+            python_import_error: None,
+            #[cfg(target_os = "linux")]
+            picker: None,
+            remote_init: None,
             monitor: None,
             pending_backup: false,
             desktop: None,
@@ -393,29 +411,91 @@ impl App {
         self.diff = result.unwrap_or_else(|e| format!("Diff 失败：{e}"));
         self.selected_path = path.into();
     }
-    fn remote_action(&mut self, action: &str) {
-        let result = (|| -> Result<String, String> {
-            let repo = self.repo()?;
-            match action {
-                "add" => {
-                    repo.remote(&self.settings.remote_name, &self.settings.remote_url)
-                        .map_err(|e| e.to_string())?;
-                    Ok("远程仓库已添加".into())
-                }
-                "fetch" => {
-                    let mut remote = repo
-                        .find_remote(&self.settings.remote_name)
-                        .map_err(|e| e.to_string())?;
-                    remote
-                        .fetch(&[] as &[&str], None, None)
-                        .map_err(|e| e.to_string())?;
-                    Ok("Fetch 完成".into())
-                }
-                _ => Err("不支持的操作".into()),
+    fn save_remote(&mut self) {
+        self.remote_init = None;
+        let result = self.repo().and_then(|repo| {
+            let name = self.settings.remote_name.trim();
+            if !git2::Remote::is_valid_name(name) {
+                return Err("远程仓库名称无效".into());
             }
-        })();
-        self.notice = result.unwrap_or_else(|e| format!("远程操作失败：{e}"));
+            match remote::inspect(&repo, &self.settings.remote_url)? {
+                remote::Target::Empty(path) => {
+                    self.remote_init = Some(path);
+                    Ok("目标是空目录，等待确认初始化裸仓库")
+                }
+                target => {
+                    remote::save(&repo, name, &target)?;
+                    Ok(match target {
+                        remote::Target::Bare(_) => "已保存裸仓库，可 Fetch 或推送当前分支",
+                        remote::Target::Worktree(_) => "已保存带工作区的仓库，可 Fetch",
+                        _ => "已保存远程地址",
+                    })
+                }
+            }
+        });
+        self.notice = result
+            .map(str::to_owned)
+            .unwrap_or_else(|e| format!("远程配置失败：{e}"));
     }
+
+    fn initialize_remote(&mut self) {
+        let Some(path) = self.remote_init.take() else {
+            return;
+        };
+        self.notice = match self.repo().and_then(|repo| {
+            remote::initialize(
+                &repo,
+                self.settings.remote_name.trim(),
+                &self.settings.remote_url,
+                &path,
+            )
+        }) {
+            Ok(()) => "裸仓库已初始化并登记，可推送当前分支".into(),
+            Err(e) => format!("初始化远程失败：{e}"),
+        };
+    }
+
+    fn fetch_remote(&mut self) {
+        self.notice = match self.repo().and_then(|repo| {
+            remote::fetch(
+                &repo,
+                self.settings.remote_name.trim(),
+                &self.settings.remote_url,
+            )
+        }) {
+            Ok(()) => "Fetch 完成".into(),
+            Err(e) => format!("Fetch 失败：{e}"),
+        };
+    }
+
+    fn push_local_remote(&mut self) {
+        self.notice = match self.repo().and_then(|repo| {
+            remote::push_local(
+                &repo,
+                self.settings.remote_name.trim(),
+                &self.settings.remote_url,
+            )
+        }) {
+            Ok(()) => "当前分支已推送到裸仓库".into(),
+            Err(e) => format!("推送失败：{e}"),
+        };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn apply_remote_picker_result(&mut self, result: PickerResult) {
+        match result {
+            Ok(Some(path)) => match path.into_os_string().into_string() {
+                Ok(path) => {
+                    self.settings.remote_url = path;
+                    self.remote_init = None;
+                }
+                Err(_) => self.notice = "文件夹路径不是有效的 Unicode".into(),
+            },
+            Ok(None) => {}
+            Err(e) => self.notice = format!("无法选择远程目录：{e}"),
+        }
+    }
+
     fn report(&mut self, message: String) {
         self.notice = message;
         if self.settings.enable_log {
@@ -460,11 +540,61 @@ impl App {
         self.custom_editor = self.filter_editor.custom.join("\n");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn apply_python_picker_result(&mut self, result: PickerResult) {
+        match result {
+            Ok(Some(path)) => match path.into_os_string().into_string() {
+                Ok(path) => {
+                    self.python_config_path = path;
+                    self.python_import_error = None;
+                }
+                Err(_) => self.python_import_error = Some("文件路径不是有效的 Unicode".into()),
+            },
+            Ok(None) => {}
+            Err(e) => self.python_import_error = Some(format!("无法选择配置文件：{e}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_picker(&mut self, ctx: &egui::Context, purpose: PickerPurpose) {
+        let (send, receive) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match purpose {
+                PickerPurpose::PythonConfig => crate::linux_ui::pick_python_config(),
+                PickerPurpose::RemoteFolder => crate::linux_ui::pick_remote_folder(),
+            };
+            let _ = send.send(result);
+            ctx.request_repaint();
+        });
+        self.picker = Some((purpose, receive));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_picker(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some((purpose, receiver)) = &self.picker else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("桌面文件选择器提前退出".into()),
+        };
+        let purpose = *purpose;
+        self.picker = None;
+        match purpose {
+            PickerPurpose::PythonConfig => self.apply_python_picker_result(result),
+            PickerPurpose::RemoteFolder => self.apply_remote_picker_result(result),
+        }
+    }
+
     fn import_python_settings(&mut self) {
+        self.python_import_error = None;
         let result =
             settings::import_python(Path::new(self.python_config_path.trim()), &self.settings)
                 .and_then(|next| {
-                    settings::save(&next)?;
+                    settings::save(&next).map_err(|e| format!("保存导入后的配置失败：{e}"))?;
                     Ok(next)
                 });
         match result {
@@ -475,11 +605,12 @@ impl App {
                 self.refresh();
                 self.notice = "已导入 Python 配置。请确认工作目录后开启监听".into();
             }
-            Err(e) => self.notice = format!("导入 Python 配置失败：{e}"),
+            Err(e) => self.python_import_error = Some(format!("导入 Python 配置失败：{e}")),
         }
     }
 
     fn reset_worktree_view(&mut self) {
+        self.remote_init = None;
         self.monitor = None;
         self.settings.auto_check = false;
         self.clear_changes();

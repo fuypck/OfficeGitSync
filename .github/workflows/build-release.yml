@@ -2,6 +2,9 @@ name: Rust Windows Release
 on:
   push:
     tags: ['v*']
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: windows-latest
@@ -9,44 +12,55 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test
-      - name: Build
-        run: cargo build --release
-        env:
-          OFFICEGITSYNC_VERSION: ${{ github.ref_name }}
-      - name: Name binary from tag
+      - name: Check for a published asset
+        id: release
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $asset = if ($tag -eq 'v0.2.0') {
-            "OfficeGitSync-$tag-windows-x64.exe"
-          } else {
-            "OfficeGitSync_$tag.exe"
+          $preview = $tag.EndsWith('-rust-preview')
+          $asset = if ($preview) { "OfficeGitSync-${tag}-windows-x64.exe" } else { "OfficeGitSync_${tag}.exe" }
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+          "preview=$($preview.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          $release = gh release view $tag --json assets,isDraft,isPrerelease 2>$null
+          $exists = $false
+          if ($LASTEXITCODE -eq 0) {
+            $release = $release | ConvertFrom-Json
+            $exists = @($release.assets | Where-Object { $_.name -eq $asset }).Count -gt 0
+            if ($exists -and ($release.isDraft -or $release.isPrerelease -ne $preview)) {
+              throw 'Existing release asset has an unexpected publication state.'
+            }
           }
-          Copy-Item target/release/OfficeGitSync.exe $asset
-      - name: Publish the Rust rewrite preview
-        if: github.ref_name == 'v0.2.0'
+          "exists=$($exists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          exit 0
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.release.outputs.exists != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.release.outputs.exists != 'true'
+      - name: Test
+        if: steps.release.outputs.exists != 'true'
+        run: cargo test --locked
+      - name: Build
+        if: steps.release.outputs.exists != 'true'
+        run: cargo build --locked --release
+        env:
+          OFFICEGITSYNC_VERSION: ${{ github.ref_name }}
+      - name: Name and hash the release binary
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          RELEASE_ASSET: ${{ steps.release.outputs.asset }}
+        run: |
+          Copy-Item target/release/OfficeGitSync.exe $env:RELEASE_ASSET
+          Get-FileHash -Algorithm SHA256 $env:RELEASE_ASSET
+      - name: Publish release
+        if: steps.release.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: OfficeGitSync v0.2.0 Preview
-          prerelease: true
-          files: OfficeGitSync-v0.2.0-windows-x64.exe
+          name: OfficeGitSync ${{ github.ref_name }}
+          prerelease: ${{ steps.release.outputs.preview }}
+          files: ${{ steps.release.outputs.asset }}
+          body_path: ${{ github.ref_name == 'v0.2.1-rust-preview' && 'docs/releases/v0.2.1.md' || '' }}
           fail_on_unmatched_files: true
-          body: |
-            ### 中文
-            OfficeGitSync Rust 重构预览版。支持选中文件后确认备份、浏览历史和导出独立副本，以及托盘、单实例和主题设置。本地备份使用内置 libgit2，无需安装 Git。
-
-            **验证情况**：Linux 本地测试和 Windows 原生 GitHub Actions 构建与测试已通过。Wine 中验证了中文界面、托盘唤醒、无 Git 提交和安全导出；递归文件监听在 Wine 中会超时。Windows 实机覆盖仍有限。附件为 CI 生成的 Windows x64 EXE。
-
-            ### English
-            Rust rewrite preview with confirmed selected-file backups, history and safe export, tray controls, single-instance activation, and themes. Local backups use embedded libgit2.
-
-            **Validation:** Linux tests and native Windows CI build and tests passed. Wine smoke tests covered Chinese UI, tray activation, commits without Git, and safe export. Recursive file watching timed out in Wine, and physical Windows coverage remains limited. The attached Windows x64 EXE was built by CI.
-      - uses: softprops/action-gh-release@v2
-        if: github.ref_name != 'v0.2.0'
-        with:
-          files: OfficeGitSync_*.exe
-          overwrite_files: true
+          overwrite_files: false

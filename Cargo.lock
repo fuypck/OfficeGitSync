@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "officegitsync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "chrono",
@@ -2507,6 +2507,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tray-icon",
+ "url",
  "windows 0.58.0",
  "winreg",
  "winres",

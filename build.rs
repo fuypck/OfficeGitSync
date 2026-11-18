@@ -4,7 +4,7 @@ fn main() {
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned());
     println!("cargo:rustc-env=OFFICEGITSYNC_VERSION={version}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let numeric = version.trim_start_matches('v');
+        let numeric = env!("CARGO_PKG_VERSION");
         println!("cargo:rerun-if-changed=assets/officegitsync.ico");
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/officegitsync.ico");
