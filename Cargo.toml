@@ -1,0 +1,21 @@
+[package]
+name = "officegitsync"
+version = "0.2.0"
+edition = "2021"
+description = "Git-powered document version backup and GUI client"
+
+[[bin]]
+name = "OfficeGitSync"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+git2 = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+globset = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
