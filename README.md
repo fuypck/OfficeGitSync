@@ -1,8 +1,8 @@
 # OfficeGitSync
 
-OfficeGitSync Rust **0.2.0 预览版**是一个面向工作文档的本地版本备份工具。它监听指定目录、提示用户确认备份，并把选中的文件变更记录到 Git。应用使用简体中文桌面界面，支持 Windows 和 Linux。
+OfficeGitSync Rust **0.2.0 Rust 预览版**是一个面向工作文档的本地版本备份工具。它监听指定目录、提示用户确认备份，并把选中的文件变更记录到 Git。应用使用简体中文桌面界面，支持 Windows 和 Linux。
 
-[English summary](#english-summary) · [产品需求与设计原则](prompt.txt) · [Rust 迁移记录](RUST_REWRITE.md)
+[下载 Windows x64 预览版](https://github.com/fuypck/OfficeGitSync/releases/tag/v0.2.0-rust-preview) · [English summary](#english-summary) · [产品需求与设计原则](prompt.txt) · [Rust 迁移记录](RUST_REWRITE.md)
 
 ## 功能
 
@@ -63,7 +63,7 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
   cargo build --locked --release --target x86_64-pc-windows-gnu
 ```
 
-交叉构建产物为 `target/x86_64-pc-windows-gnu/release/OfficeGitSync.exe`。常规构建使用 [Cargo.toml](Cargo.toml) 中的版本。发布工作流构建 `v*` 标签时会把标签版本传给程序。预览构建可在 [GitHub Actions](https://github.com/fuypck/OfficeGitSync/actions) 中查看，已发布版本以 [GitHub Releases](https://github.com/fuypck/OfficeGitSync/releases) 为准。
+交叉构建产物为 `target/x86_64-pc-windows-gnu/release/OfficeGitSync.exe`。常规构建使用 [Cargo.toml](Cargo.toml) 中的版本 `0.2.0`。此预览版发布标签为 `v0.2.0-rust-preview`，沿用同一 Windows x64 构建。发布工作流构建 `v*` 标签时会把标签版本传给程序。预览构建可在 [GitHub Actions](https://github.com/fuypck/OfficeGitSync/actions) 中查看，已发布版本以 [GitHub Releases](https://github.com/fuypck/OfficeGitSync/releases) 为准。
 
 ## 项目状态
 
@@ -79,4 +79,4 @@ OfficeGitSync is a Simplified Chinese desktop app for local document version bac
 
 Choose a working directory, enable monitoring or scan manually, and confirm the files you want to commit. To recover a version, export it into a new subdirectory outside the working tree. Windows offers native folder pickers. On Linux, Chinese text uses a Fontconfig-discovered font, and the tray requires a StatusNotifierItem host.
 
-Build with Rust stable and `cargo build --locked --release`. See [Rust build instructions](#rust-构建) for the Windows x64 cross-build. The preview supports text diffs and explicit Fetch. Push, Pull, in-place restoration, and history deletion are outside the current implementation.
+[Download the Windows x64 Rust preview](https://github.com/fuypck/OfficeGitSync/releases/tag/v0.2.0-rust-preview). Build with Rust stable and `cargo build --locked --release`. See [Rust build instructions](#rust-构建) for the Windows x64 cross-build. The preview supports text diffs and explicit Fetch. Push, Pull, in-place restoration, and history deletion are outside the current implementation.

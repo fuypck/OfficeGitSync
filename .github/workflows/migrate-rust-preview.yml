@@ -1,0 +1,49 @@
+name: Rename existing Rust preview
+on:
+  push:
+    branches: [rust-rewrite]
+    paths: ['.github/workflows/migrate-rust-preview.yml']
+permissions:
+  contents: write
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Publish the existing binary under the preview tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          old=v0.2.0
+          new=v0.2.0-rust-preview
+          asset=OfficeGitSync-v0.2.0-windows-x64.exe
+          expected=e89b4caedc871dcbe0967e63ade390a969eab17dfbcb5cdd22da5c0b6e5936fd
+          commit=$(git rev-parse "$old^{}")
+          test "$commit" = 4b21c6aaccc26dfeff82c6b63a19b69fe35714ee
+          work=$(mktemp -d)
+          gh release view "$old" --json body --jq .body > "$work/notes.md"
+          gh release download "$old" --pattern "$asset" --dir "$work"
+          printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c -
+          if ! git show-ref --verify --quiet "refs/tags/$new"; then
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                tag -a "$new" "$commit" -m 'OfficeGitSync v0.2.0 Rust preview'
+            # The workflow token suppresses the existing tag-triggered build.
+            git push origin "refs/tags/$new"
+          fi
+          test "$(git cat-file -t "$new")" = tag
+          test "$(git rev-parse "$new^{}")" = "$commit"
+          if ! gh release view "$new" >/dev/null 2>&1; then
+            gh release create "$new" "$work/$asset" --verify-tag --prerelease \
+              --title 'OfficeGitSync v0.2.0-rust-preview' --notes-file "$work/notes.md"
+          fi
+          gh release view "$new" --json isPrerelease,isDraft,body \
+            --jq 'select(.isPrerelease and (.isDraft | not)) | .body' > "$work/new-notes.md"
+          cmp "$work/notes.md" "$work/new-notes.md"
+          mkdir "$work/check"
+          gh release download "$new" --pattern "$asset" --dir "$work/check"
+          printf '%s  %s\n' "$expected" "$work/check/$asset" | sha256sum -c -
